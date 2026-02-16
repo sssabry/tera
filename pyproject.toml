@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "TERA"
+version = "0.1.0"
+description = "TM-based Reachability Engine"
+authors = [
+    { name="Salma Sabry"}
+]
+requires-python = ">=3.10"
+dependencies = ["numpy", "matplotlib", "tqdm", "shapely", "scipy"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["TERA*"]

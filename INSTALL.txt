@@ -1,0 +1,63 @@
+
+TERA Installation Instructions
+==============================
+
+This project uses a standard Python package layout. From the repo root:
+
+1) Create/activate sage environment
+   - conda activate sage or micromamba activate sage
+
+2) Install in editable mode
+   - python -m pip install -e .
+
+3) Quick import check
+   - python -c "import TERA; print(TERA.__file__)"
+
+Notes
+-----
+- If imports fail in notebooks, it usually means the notebook kernel is not
+  using the same Python environment where you installed the package.
+- Ensure the kernel you're running is the one you initialized after activating your environment.
+- SageMath is required for core functionality; this project is currently intended to be installed in a SageMath environment (editable install).
+
+SageMath (Mandatory) + Jupyter Setup (Optional)
+----------------------------------
+These steps install SageMath in a dedicated environment. 
+There are additional steps to make its kernel available in Jupyter (e.g. to run the benchmark notebooks in Examples/).
+NOTE: Paths below use placeholders; use your own.
+
+Micromamba (recommended) for Linux
+1) Install micromamba
+   - curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bin/micromamba
+
+2) Initialize shell and reload
+   - ./bin/micromamba shell init -s bash -r ~/micromamba
+   - source ~/.bashrc
+
+3) Create and activate Sage environment
+   - micromamba create -n sage -c conda-forge sage
+   - micromamba activate sage
+
+4) After activating your Sage environment, install the Python dependencies:
+  - sage -pip install -r </path/to/repo>/TERA/requirements.txt
+
+5) Install Jupyter (optional)
+   - micromamba install jupyterlab
+
+6) Register the Sage kernel (optional)
+   - jupyter kernelspec list
+   - Identify the Sage kernel path, typically:
+     /home/<user>/micromamba/envs/sage/share/jupyter/kernels/sagemath
+   - Register it (user-level):
+     jupyter kernelspec install --user "/home/<user>/micromamba/envs/sage/share/jupyter/kernels/sagemath" --name sagemath
+
+7) When done running TERA: Deactivate environment
+   - micromamba deactivate
+
+Installing Python packages into Sage
+------------------------------------
+If you extend your local version of TERA and want to ensure another python package is available,
+please use the following instruction.
+
+From an activated Sage environment or Sage kernel:
+  - sage -pip install --user <package_name>
