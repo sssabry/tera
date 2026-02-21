@@ -437,6 +437,57 @@ class Polynomial:
 
         return Polynomial(_poly=new_sage_poly)
 
+    def truncate_by_var_index(self, var_index: int, max_degree: int) -> 'Polynomial':
+        """
+        Return a new Polynomial containing only terms whose exponent in the selected variable
+        (given by var_index) is <= max_degree. Other variable exponents are unrestricted.
+        This is used for Picard-in-time truncation (truncate by time degree only)!!
+        """
+        if not (0 <= var_index < self.dim):
+            raise ValueError(f"Variable index {var_index} out of bounds for dimension {self.dim}.")
+        if max_degree < 0:
+            return Polynomial(_poly=self.ring.zero(), _ring=self.ring)
+
+        def _as_py_exp(et):
+            try:
+                e = tuple(et)
+            except Exception:
+                try:
+                    e = tuple(et.exponents())
+                except Exception:
+                    try:
+                        e = tuple(et.list())
+                    except Exception:
+                        e = (int(et),)
+            return e
+
+        new_dict = {}
+
+        if self.dim == 1:
+            for exponent, coeff in self.poly.dict().items():
+                e = _as_py_exp(exponent)
+                if len(e) == 0:
+                    e = (0,)
+                if len(e) > 1:
+                    e = e[:1]
+                if e[0] <= max_degree:
+                    # Keep x^5 * t^1 when truncating by t-degree 1, even if total degree is 6.
+                    new_dict[exponent] = coeff
+        else:
+            for exp_tuple, coeff in self.poly.dict().items():
+                e = _as_py_exp(exp_tuple)
+                if len(e) == 0:
+                    e = (0,) * self.dim
+                elif len(e) < self.dim:
+                    e = e + (0,) * (self.dim - len(e))
+                elif len(e) > self.dim:
+                    e = e[:self.dim]
+
+                if e[var_index] <= max_degree:
+                    new_dict[exp_tuple] = coeff
+
+        return Polynomial(_poly=self.ring(new_dict), _ring=self.ring)
+
     # Utils
     def __str__(self):
         return str(self.poly)
@@ -464,4 +515,3 @@ def bound_monomial(coeff, exponents, domain) -> Interval:
         if exp > 0:
             term_bound *= domain[i] ** exp
     return term_bound
-

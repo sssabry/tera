@@ -1,7 +1,7 @@
 """Preconditioning helpers for Taylor model flowpipes."""
 
 import copy
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from sage.all import RIF, PolynomialRing
 import numpy as np
 
@@ -9,6 +9,260 @@ from TERA.TMCore.TMVector import TMVector
 from TERA.TMCore.TaylorModel import TaylorModel
 from TERA.TMCore.Interval import Interval
 from TERA.TMCore.Polynomial import Polynomial
+
+# Right-model invariant check (L/R)
+def check_right_invariant(R: TMVector, state_dim: int, slack: float = 1e-12, time_var: Optional[str] = None, verbose: bool = False):
+    """
+    Check that the right model maps the standard normalized box B=[-1,1]^n into itself
+    required by the L/R compositional integration!!
+    """
+    bounds = []
+    slack_f = float(slack)
+    accept = Interval(-1.0 - slack_f, 1.0 + slack_f)
+
+    ring = R.tms[0].poly.ring
+    dim = ring.ngens()
+    n_comp = len(R.tms)
+    var_names = ring.variable_names()
+    gens = ring.gens()
+    box = Interval(-1.0, 1.0)
+
+    valid_shape = (n_comp == state_dim and dim == state_dim) or (n_comp == state_dim + 1 and dim == state_dim + 1)
+    if not valid_shape:
+        if verbose:
+            print(
+                f"L/R invariant check: invalid shape. "
+                f"n_comp={n_comp}, state_dim={state_dim}, ring_dim={dim}, vars={var_names}"
+            )
+        return False, bounds, "SHAPE_MISMATCH", accept
+
+    tgen = None
+    time_index = None
+    if time_var is not None and time_var in var_names:
+        time_index = var_names.index(time_var)
+        tgen = gens[time_index]
+
+    def _depends_on_var(poly_obj, gen) -> bool:
+        try:
+            return poly_obj.degree(gen) > 0
+        except Exception:
+            pass
+        try:
+            return gen in poly_obj.variables()
+        except Exception:
+            pass
+        try:
+            sub0 = poly_obj.subs({gen: 0})
+            sub1 = poly_obj.subs({gen: 1})
+            return sub0 != sub1
+        except Exception:
+            return True
+
+    # right model is expected to be time-free; enforce or fail fast.
+    if tgen is not None:
+        for i in range(state_dim):
+            poly_obj = R.tms[i].poly.poly
+            if _depends_on_var(poly_obj, tgen):
+                if verbose:
+                    print(
+                        f"L/R invariant check: right model depends on time var '{time_var}' "
+                        f"at component {i}. vars={var_names}"
+                    )
+                return False, bounds, "TIME_DEP", accept
+
+    for i in range(state_dim):
+        tm = R.tms[i]
+        if len(tm.domain) != dim:
+            if verbose:
+                print(
+                    f"L/R invariant check: domain dim mismatch at component {i}. "
+                    f"domain={tm.domain}, expected_dim={dim}, vars={var_names}"
+                )
+            return False, bounds, "DOMAIN_DIM", accept
+        domain_eval = list(tm.domain)
+        for j in range(state_dim):
+            domain_eval[j] = box
+        if time_index is not None:
+            domain_eval[time_index] = tm.domain[time_index]
+        bound = tm.poly.range_evaluate(tuple(domain_eval)) + tm.remainder
+        bounds.append(bound)
+
+    if not bounds:
+        return False, bounds, "EMPTY_BOUNDS", accept
+
+    ok = all(accept.encloses(b) for b in bounds)
+    if not ok:
+        return False, bounds, "BOUND_VIOLATION", accept
+    return True, bounds, None, accept
+
+# Bünger corrected shrink wrapping (domain inflation p(qB))
+def _remainder_radii(T_state: TMVector) -> List[RIF]:
+    rads = []
+    for i, tm in enumerate(T_state.tms):
+        if not tm.remainder.encloses(Interval(0)):
+            raise ValueError(f"Remainder does not contain 0 at component {i}: {tm.remainder}")
+        lo = RIF(tm.remainder.lower)
+        hi = RIF(tm.remainder.upper)
+        rads.append(max(abs(lo), abs(hi)))
+    return rads
+
+
+def _bound_jacobian_poly_over_box(T_state: TMVector, domain_box: List[Interval]) -> List[List[Interval]]:
+    n = len(T_state.tms)
+    ring = T_state.tms[0].poly.ring
+    dim = ring.ngens()
+    gens = ring.gens()
+    M = [[Interval(0) for _ in range(n)] for _ in range(n)]
+    if len(domain_box) < dim:
+        domain_box = list(domain_box) + [Interval(0.0, 0.0)] * (dim - len(domain_box))
+    for i in range(n):
+        p_i = T_state.tms[i].poly.poly
+        for j in range(n):
+            dpi = p_i.derivative(gens[j])
+            if hasattr(dpi, "is_zero") and dpi.is_zero():
+                M[i][j] = Interval(0)
+                continue
+            deriv_wrapper = Polynomial(_poly=dpi, _ring=dpi.parent())
+            M[i][j] = deriv_wrapper.range_evaluate(tuple(domain_box))
+    return M
+
+def _choose_preconditioner_R(T_state: TMVector) -> Optional[np.ndarray]:
+    try:
+        A0 = T_state.get_jacobian()
+        R = np.linalg.inv(A0)
+        return R
+    except Exception:
+        return None
+
+def _bound_abs_gprime_over_qB(T_state: TMVector, q: List[RIF], R: Optional[np.ndarray]) -> List[List[RIF]]:
+    q_box = [Interval(-qi, qi) for qi in q]
+    M_p_int = _bound_jacobian_poly_over_box(T_state, q_box)
+    n = len(M_p_int)
+
+    M_f_int = [[Interval(0) for _ in range(n)] for _ in range(n)]
+    if R is None:
+        M_f_int = M_p_int
+    else:
+        for i in range(n):
+            for j in range(n):
+                acc = Interval(0)
+                for k in range(n):
+                    acc += Interval(R[i, k]) * M_p_int[k][j]
+                M_f_int[i][j] = acc
+
+    M_g = [[RIF(0) for _ in range(n)] for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                g_int = M_f_int[i][j] - Interval(1)
+                M_g[i][j] = max(abs(RIF(g_int.lower)), abs(RIF(g_int.upper)))
+            else:
+                f_int = M_f_int[i][j]
+                M_g[i][j] = max(abs(RIF(f_int.lower)), abs(RIF(f_int.upper)))
+    return M_g
+
+def shrink_wrap_corrected(T_state: TMVector, time_var: Optional[str] = None, slack_q: float = 1e-12,
+    max_iter: int = 10, q_cap: float = 1.2, use_preconditioning: bool = True, verbose: bool = False, 
+    strict_sanity: bool = False) -> dict:
+    """Matching Florian Bunger's corrected shrink wrapping method (based on Berz/Makino classic theory)"""
+
+    n = len(T_state.tms)
+    ring = T_state.tms[0].poly.ring
+    dim = ring.ngens()
+    var_names = ring.variable_names()
+    gens = ring.gens()
+
+    valid_shape = (dim == n) or (dim == n + 1 and time_var is not None and time_var in var_names)
+    if not valid_shape:
+        return {'success': False, 'reason': 'DIM_MISMATCH'}
+
+    if time_var is not None and time_var in var_names:
+        tgen = gens[var_names.index(time_var)]
+        for i in range(n):
+            p_i = T_state.tms[i].poly.poly
+            depends = False
+            try:
+                depends = p_i.degree(tgen) > 0
+            except Exception:
+                try:
+                    depends = tgen in p_i.variables()
+                except Exception:
+                    try:
+                        depends = p_i.subs({tgen: 0}) != p_i.subs({tgen: 1})
+                    except Exception:
+                        depends = True
+            if depends:
+                return {'success': False, 'reason': 'TIME_DEP'}
+
+    r = _remainder_radii(T_state)
+    q = [RIF(1) + ri for ri in r]
+    R = _choose_preconditioner_R(T_state) if use_preconditioning else None
+    eps = RIF(slack_q)
+
+    for _ in range(max_iter):
+        M_g = _bound_abs_gprime_over_qB(T_state, q, R)
+        dq = [qi - RIF(1) for qi in q]
+        s = []
+        for i in range(n):
+            acc = RIF(0)
+            for j in range(n):
+                acc += M_g[i][j] * dq[j]
+            s.append(acc)
+        q_new = [RIF(1) + r[i] + s[i] for i in range(n)]
+
+        if verbose and n == 1:
+            q_box = [Interval(-q[0], q[0])]
+            M_p_int = _bound_jacobian_poly_over_box(T_state, q_box)
+            f_int = M_p_int[0][0]
+            if R is not None:
+                f_int = Interval(R[0, 0]) * f_int
+            g_int = f_int - Interval(1)
+            g_abs = max(abs(RIF(g_int.lower)), abs(RIF(g_int.upper)))
+            # optional debug info for 1D
+            print(f"[shrink_wrap] r={r[0]}, q={q[0]}, p'={f_int}, g'={g_int}, |g'|={g_abs}")
+
+        if any(float(qi) > q_cap for qi in q_new):
+            return {'success': False, 'reason': 'Q_TOO_LARGE', 'q': q_new}
+
+        if all(q_new[i] <= q[i] + eps for i in range(n)):
+            q = q_new
+            break
+        q = q_new
+    else:
+        return {'success': False, 'reason': 'NO_CONVERGENCE', 'q': q}
+
+    subs_map = {gens[j]: q[j] * gens[j] for j in range(n)}
+    new_tms = []
+    for i in range(n):
+        tm = T_state.tms[i]
+        p_i = tm.poly.poly
+        p_i_sw = ring(p_i.subs(subs_map))
+        poly_sw = Polynomial(_poly=p_i_sw, _ring=ring)
+        new_tm = TaylorModel(
+            poly=poly_sw,
+            rem=Interval(0),
+            domain=tm.domain,
+            ref_point=tm.ref_point,
+            max_order=tm.max_order
+        )
+        new_tms.append(new_tm)
+
+    T_sw = TMVector(new_tms)
+
+    try:
+        orig_bounds = T_state.bound()
+        sw_bounds = T_sw.bound()
+        for i in range(n):
+            if not sw_bounds[i].encloses(orig_bounds[i]):
+                if strict_sanity:
+                    return {'success': False, 'reason': 'SANITY_FAIL'}
+                return {'success': True, 'T_sw': T_sw, 'q': q, 'reason': 'OK', 'warn': 'SANITY_FAIL'}
+    except Exception:
+        if strict_sanity:
+            return {'success': False, 'reason': 'SANITY_FAIL'}
+        return {'success': True, 'T_sw': T_sw, 'q': q, 'reason': 'OK', 'warn': 'SANITY_FAIL'}
+
+    return {'success': True, 'T_sw': T_sw, 'q': q, 'reason': 'OK'}
 
 # Shared helper methods
 def evaluate_at_time(tmv_prev: TMVector, tau: float, time_var_name: str="t") -> TMVector:

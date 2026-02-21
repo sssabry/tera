@@ -25,8 +25,10 @@ def compute_polynomial_flowpipe(x0: TMVector, ode_rhs: Callable[[TMVector], TMVe
             time_var_idx = x0.tms[0].poly.dim - 1
             time_gen = x0.tms[0].poly.vars[time_var_idx]
 
-            # truncate terms where degree t > (k - 1)
-            truncated_poly = velocity_tm.poly.truncate(max_order=k-1)
+            # truncate by degree in time only (picard iteration order in time)
+            time_gen = velocity_tm.poly.ring.gens()[-1]
+            time_idx = len(velocity_tm.poly.ring.gens()) - 1
+            truncated_poly = velocity_tm.poly.truncate_by_var_index(time_idx, k-1)
 
             integrated_poly = truncated_poly.definite_integral(
                 int_var=time_gen, 

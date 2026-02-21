@@ -9,16 +9,23 @@ from TERA.TMCore.TaylorModel import TaylorModel
 from TERA.TMCore.Polynomial import Polynomial
 from TERA.TMFlow import Picard
 
-def compute_initial_guess(current_tmv: TMVector, remainder_estimation: List[Interval]) -> TMVector:
+def compute_initial_guess(current_tmv: TMVector, remainder_estimation: List[Interval], state_dim: Optional[int] = None) -> TMVector:
     """Create an initial remainder guess for Picard verification."""
 
-    if len(remainder_estimation) != len(current_tmv):
-        raise ValueError("Remainder estimation dimension does not match TMVector dimension.")
+    if state_dim is None:
+        if len(remainder_estimation) != len(current_tmv):
+            raise ValueError("Remainder estimation dimension does not match TMVector dimension.")
+    else:
+        if not (0 < state_dim <= len(current_tmv)):
+            raise ValueError("state_dim must be in (0, len(current_tmv)].")
+        if len(remainder_estimation) != state_dim:
+            raise ValueError("Remainder estimation dimension does not match state_dim.")
         
     # Create a copy to avoid mutating the original polynomial flowpipe
     guess_tmv = deepcopy(current_tmv)
     
-    for i in range(len(guess_tmv)):
+    assign_dim = len(guess_tmv) if state_dim is None else state_dim
+    for i in range(assign_dim):
         # Assign the user-provided guess
         guess_tmv.tms[i].remainder = remainder_estimation[i]
         
@@ -26,7 +33,7 @@ def compute_initial_guess(current_tmv: TMVector, remainder_estimation: List[Inte
 
 
 def verify_remainder(guess_tmv: TMVector, x0: TMVector,ode_rhs: Callable[[TMVector], TMVector], time_var: str,
-    time_step: Interval, time_start: float, order: int, cutoff_threshold: float):
+    time_step: Interval, time_start: float, order: int, cutoff_threshold: float, state_dim: Optional[int] = None):
     """Verify that the guessed remainder encloses Picard propagation."""
 
     # apply picard operator with interval arithmetic
@@ -47,7 +54,8 @@ def verify_remainder(guess_tmv: TMVector, x0: TMVector,ode_rhs: Callable[[TMVect
     # compute polynomial difference (truncation error)
     truncation_errors = []
     
-    for i in range(len(tmv_tmp)):
+    check_dim = len(tmv_tmp) if state_dim is None else state_dim
+    for i in range(check_dim):
         # calculate P_out - P_in
         poly_diff = tmv_tmp.tms[i].poly - guess_tmv.tms[i].poly
         
@@ -60,12 +68,12 @@ def verify_remainder(guess_tmv: TMVector, x0: TMVector,ode_rhs: Callable[[TMVect
         truncation_errors.append(Interval(-trunc_rad, trunc_rad))
 
     # add uncertainties onto remainder to get total error
-    for i in range(len(tmv_tmp)):
+    for i in range(check_dim):
         tmv_tmp.tms[i].remainder += truncation_errors[i]
 
     # perform inclusion check to ensure computed_error <= guessed_error
     success = True
-    for i in range(len(tmv_tmp)):
+    for i in range(check_dim):
         computed_rem = tmv_tmp.tms[i].remainder
         guess_rem = guess_tmv.tms[i].remainder
         

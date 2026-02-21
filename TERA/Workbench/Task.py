@@ -177,6 +177,8 @@ class TaskRunner:
             id_stag_od_rel_tol=config.engine_params.get('id_stag_od_rel_tol', 1e-6),
             id_stag_lambda=config.engine_params.get('id_stag_lambda', 1.0),
             hybrid_id_full_linear_on_stagnation=config.engine_params.get('hybrid_id_full_linear_on_stagnation', False),
+            shrink_wrap_mode=config.engine_params.get('shrink_wrap_mode', False),
+            verbose=config.engine_params.get('verbose', False),
             progress_bar=progress_bar
         )
         
@@ -270,6 +272,8 @@ class TaskRunner:
                 id_stag_od_rel_tol=ep.get('id_stag_od_rel_tol', 1e-6),
                 id_stag_lambda=ep.get('id_stag_lambda', 1.0),
                 hybrid_id_full_linear_on_stagnation=ep.get('hybrid_id_full_linear_on_stagnation', False),
+                shrink_wrap_mode=ep.get('shrink_wrap_mode', False),
+                verbose=ep.get('verbose', False),
                 progress_bar=progress_bar,
                 precondition_setup=ep.get('precondition_setup', 'QR'),
                 remainder_estimation=config.remainder_estimation,

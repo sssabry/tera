@@ -24,13 +24,10 @@ class TMReach:
             max_iterations:int =40, remainder_estimation: Optional[List[Interval]] = None, time_var: str  = 't',
             precondition_setup: str = "QR", min_step: float = 1e-6, max_step: float = 0.5, fixed_step_mode: bool = False,
             adaptive_order: bool = False, min_order: int = 2, max_order: int = 8, progress_bar: bool = False,
-            step_grow_width_cap: Optional[float] = None,
-            id_preserve_coupling_on_stagnation: bool = False,
-            id_stag_c_tol: float = 1e-12,
-            id_stag_s_tol: float = 1e-10,
-            id_stag_od_rel_tol: float = 1e-6,
-            id_stag_lambda: float = 1.0,
-            hybrid_id_full_linear_on_stagnation: bool = False):
+            step_grow_width_cap: Optional[float] = None, id_preserve_coupling_on_stagnation: bool = False,
+            id_stag_c_tol: float = 1e-12, id_stag_s_tol: float = 1e-10, id_stag_od_rel_tol: float = 1e-6,
+            id_stag_lambda: float = 1.0, hybrid_id_full_linear_on_stagnation: bool = False,
+            shrink_wrap_mode: bool = False, verbose: bool = False):
         """Initialize the reachability engine."""
         self.ode_exprs = ode_exprs
         self.state_vars = state_vars
@@ -39,7 +36,10 @@ class TMReach:
         self.cutoff_threshold = cutoff_threshold
         self.time_var = time_var
         self.max_iterations = max_iterations
+
         self.preconditioning = precondition_setup
+        self.shrink_wrap_mode = bool(shrink_wrap_mode)
+        self.verbose = bool(verbose)
 
         self.adaptive_order = adaptive_order
         self.min_order = min_order
@@ -67,7 +67,6 @@ class TMReach:
         self.hybrid_id_full_linear_on_stagnation = bool(hybrid_id_full_linear_on_stagnation)
         self._id_prev_center = None
         self._id_prev_scales = None
-
 
         # profiling stats
         self.profile_times = defaultdict(float)
@@ -141,6 +140,9 @@ class TMReach:
         time_var = self.time_var
         lambda_args = ", ".join(var_names + [time_var])
 
+        time_sym = SR.var(self.time_var)
+        uses_time = any(bool(expr.has(time_sym)) for expr in ode_exprs)
+
         # uses fast_callable for speed of compilation
         compiled_funcs = []
         for expr in ode_exprs:
@@ -171,7 +173,9 @@ class TMReach:
 
             # ensure time variable is available for time-varying dynamics
             if len(args) == len(vars):
-                # fall back to a constant time TM (t=0) if not present
+                if uses_time:
+                    # non-autonomous ODE: MUST have time var. raise error
+                    return None
                 try:
                     time_tm = TaylorModel.from_constant(0.0, args[0])
                     args = list(args) + [time_tm]
@@ -546,20 +550,23 @@ class TMReach:
                     effective_rad = max(scaled_est_rad, 1e-12)
                     scaled_estimation.append(Interval(-effective_rad, effective_rad))
 
-                # extract state components only for remainder computation
-                state_poly_flow_tms = poly_flow_tmv.tms[:state_dim]
-                state_poly_flow_tmv = TMVector(state_poly_flow_tms)
-
                 if len(scaled_estimation) != self.state_dim:
                     scaled_estimation = scaled_estimation[:self.state_dim]
-                guess_tmv = Remainder.compute_initial_guess(state_poly_flow_tmv, scaled_estimation)
+                # keep full poly_flow_tmv (state + time if present) 
+                full_poly_flow_tmv = poly_flow_tmv
+                guess_tmv = Remainder.compute_initial_guess(
+                    current_tmv=full_poly_flow_tmv,
+                    remainder_estimation=scaled_estimation,
+                    state_dim=state_dim
+                )
                 
                 # verify
                 with self._measure("Integrate: Verify"):
                     success, verified_tmv, trunc_errors = Remainder.verify_remainder(
                         guess_tmv=guess_tmv, x0=x0_tmv, ode_rhs=self.ode_rhs, 
                         time_var=self.time_var, time_step=time_interval, time_start=time_start,
-                        order=current_order, cutoff_threshold=self.cutoff_threshold
+                        order=current_order, cutoff_threshold=self.cutoff_threshold,
+                        state_dim=state_dim
                     )
 
                 if verified_tmv is None:
@@ -578,8 +585,10 @@ class TMReach:
                     ]
                     # refine
                     with self._measure("Integrate: Refine"):
+                        verified_state = TMVector(verified_tmv.tms[:state_dim])
+                        x0_state = TMVector(x0_tmv.tms[:state_dim])
                         final_tmv = Remainder.refine_remainder(
-                            verified_tmv=verified_tmv, x0=x0_tmv, ode_rhs=self.ode_rhs, 
+                            verified_tmv=verified_state, x0=x0_state, ode_rhs=self.ode_rhs, 
                             time_var=self.time_var, time_step=time_interval, 
                             order=current_order, truncation_errors=trunc_errors, 
                             max_refinements=self.max_iterations, jacobian=jacobian_matrix
@@ -1033,7 +1042,7 @@ class TMReach:
 
             # perform the step
             with self._measure("Full Step (L-R)"):
-                result = self._advance_left_right_step(left_tmv, right_tmv, h, time_start, current_order)
+                result = self._advance_left_right_step(left_tmv, right_tmv, h, time_start, current_order, step_idx=len(flowpipe_data))
 
             if result['success']:
                 # successful? update state for next step
@@ -1087,7 +1096,7 @@ class TMReach:
             # FAILURE BLOCK
             else:
                 if self.adaptive_order and current_order < self.max_order:
-                    current_p += 1
+                    current_order += 1
                     continue
                 if self.fixed_step_mode:
                     print(f"\nStep failed at t={t_current}. Fixed step mode abort.")
@@ -1104,7 +1113,7 @@ class TMReach:
         return flowpipe_data, status
 
     def _advance_left_right_step(self, L_prev: TMVector, R_prev: TMVector, h: float, t_start: float,
-                                 current_order: int) -> dict:
+                                 current_order: int, step_idx: Optional[int] = None) -> dict:
         """
         executes one step of the left-right architecture's algorithm
         integrate -> decompose -> compose -> normalize
@@ -1180,6 +1189,24 @@ class TMReach:
                     tm.ref_point = copy.deepcopy(R_prev.ref_point)
 
                 T_state = Q_poly_state.compose(replacements)
+                if self.shrink_wrap_mode:
+                    sw_verbose = getattr(self, "verbose", False)
+                    sw = Precondition.shrink_wrap_corrected(
+                        T_state,
+                        time_var=self.time_var,
+                        slack_q=1e-12,
+                        max_iter=10,
+                        q_cap=1.2,
+                        use_preconditioning=True,
+                        verbose=sw_verbose
+                    )
+                    if sw.get('success', False):
+                        T_state = sw['T_sw']
+                        if sw_verbose and sw.get('warn') == 'SANITY_FAIL':
+                            print("L/R shrink wrap warning: SANITY_FAIL")
+                    else:
+                        if sw_verbose:
+                            print(f"L/R shrink wrap skipped: {sw.get('reason', 'UNKNOWN')}")
                 T_target = TMVector(list(T_state.tms) + [copy.deepcopy(R_prev.tms[-1])])
 
         except Exception as e:
@@ -1247,7 +1274,123 @@ class TMReach:
             R_next.domain = copy.deepcopy(R_next.tms[0].domain)
             R_next.ref_point = copy.deepcopy(R_next.tms[0].ref_point)
 
+            if self.shrink_wrap_mode:
+                domain_full = list(R_next.domain)
+                ref_full = tuple(R_next.ref_point)
+                time_tm_orig = R_next.tms[-1]
+                state_tms_orig = [tm.copy() for tm in R_next.tms[:state_dim]]
+                try:
+                    R_next_state = TMVector(R_next.tms[:state_dim])
+                    ring = R_next_state.tms[0].poly.ring
+                    dim = ring.ngens()
+                    state_box = [Interval(-1.0, 1.0)] * state_dim
+                    if len(ref_full) >= state_dim:
+                        state_ref = list(ref_full[:state_dim])
+                    else:
+                        state_ref = [0.0] * state_dim
+                    if dim == state_dim + 1 and self.time_var in ring.variable_names():
+                        state_box = state_box + [Interval(0.0, 0.0)]
+                        state_ref = state_ref + [0.0]
+                    for tm in R_next_state.tms:
+                        tm.domain = list(state_box)
+                        tm.ref_point = tuple(state_ref)
+
+                    sw_verbose = getattr(self, "verbose", False)
+                    sw2 = Precondition.shrink_wrap_corrected(
+                        R_next_state,
+                        time_var=self.time_var,
+                        slack_q=1e-12,
+                        max_iter=10,
+                        q_cap=1.2,
+                        use_preconditioning=True,
+                        verbose=sw_verbose
+                    )
+                    if sw2.get('success', False):
+                        candidate_state = sw2['T_sw']
+                        if sw_verbose and sw2.get('warn') == 'SANITY_FAIL':
+                            print("L/R shrink wrap (R_next) warning: SANITY_FAIL")
+                        for i in range(state_dim):
+                            R_next.tms[i] = candidate_state.tms[i]
+                            R_next.tms[i].domain = domain_full
+                            R_next.tms[i].ref_point = ref_full
+                        ok2, _, reason2, _ = Precondition.check_right_invariant(
+                            R_next, state_dim=state_dim, slack=1e-12, time_var=self.time_var, verbose=sw_verbose
+                        )
+                        if not ok2:
+                            # attempt re-normalization before reverting
+                            try:
+                                range_of_yr2 = candidate_state.bound()
+                                midpoints_m2 = [iv.midpoint() for iv in range_of_yr2]
+                                scale_factors_S2 = []
+                                inv_scale_factors_S2 = []
+                                MIN_RAD = 1e-14
+                                for iv in range_of_yr2:
+                                    rad = float(iv.radius())
+                                    if rad < MIN_RAD:
+                                        rad = MIN_RAD
+                                    scale_factors_S2.append(rad)
+                                    inv_scale_factors_S2.append(1.0 / rad)
+
+                                T_target2 = TMVector(list(candidate_state.tms) + [time_tm_orig])
+                                R_next2 = Precondition.normalize_right_model(
+                                    tm_target=T_target2,
+                                    midpoints_m=midpoints_m2,
+                                    inv_scale_factors_S=inv_scale_factors_S2
+                                )
+                                for tm in R_next2.tms:
+                                    tm.domain = domain_full
+                                    tm.ref_point = ref_full
+                                R_next2.domain = list(domain_full)
+                                R_next2.ref_point = ref_full
+
+                                ok3, _, _, _ = Precondition.check_right_invariant(
+                                    R_next2, state_dim=state_dim, slack=1e-12, time_var=self.time_var, verbose=sw_verbose
+                                )
+                                if ok3:
+                                    if sw_verbose:
+                                        q_list = sw2.get('q', [])
+                                        q_max = max([float(q) for q in q_list]) if q_list else None
+                                        print(f"L/R shrink wrap (R_next) kept after re-normalize; q_max={q_max}")
+                                    R_next = R_next2
+                                    ok2 = True
+                            except Exception:
+                                pass
+                            if not ok2:
+                                if sw_verbose:
+                                    q_list = sw2.get('q', [])
+                                    q_max = max([float(q) for q in q_list]) if q_list else None
+                                    print(f"L/R shrink wrap (R_next) reverted: invariant violated; q_max={q_max}")
+                                for i in range(state_dim):
+                                    R_next.tms[i] = state_tms_orig[i]
+                        else:
+                            if sw_verbose:
+                                q_list = sw2.get('q', [])
+                                q_max = max([float(q) for q in q_list]) if q_list else None
+                                print(f"L/R shrink wrap (R_next) kept: q_max={q_max}")
+                    else:
+                        if sw_verbose:
+                            q_list = sw2.get('q', [])
+                            q_max = max([float(q) for q in q_list]) if q_list else None
+                            print(f"L/R shrink wrap (R_next) skipped: reason={sw2.get('reason', 'UNKNOWN')}, q_max={q_max}")
+                except Exception:
+                    for i in range(state_dim):
+                        R_next.tms[i] = state_tms_orig[i]
+
             A_l = Q @ np.diag(scale_factors_S)
+
+            slack = 1e-12
+            ok, bounds, reason, accept = Precondition.check_right_invariant(
+                R_next, state_dim=state_dim, slack=slack, time_var=self.time_var, verbose=getattr(self, "verbose", False)
+            )
+            if not ok:
+                violated = [(i, b) for i, b in enumerate(bounds) if not accept.encloses(b)]
+                step_label = step_idx if step_idx is not None else "?"
+                # FIXME before final merge to main
+                print(
+                    f"L/R invariant failed at step {step_label}, h={h}: "
+                    f"violations={violated}, target={accept}, reason={reason}, bounds_len={len(bounds)}"
+                )
+                return {'success': False, 'reason': 'R_INVARIANT'}
         
         return {
             'success': True,
