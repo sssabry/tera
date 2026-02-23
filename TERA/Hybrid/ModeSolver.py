@@ -102,15 +102,7 @@ class ModeSolver(TMReach):
             time_end=time_end,
             time_start=time_start
         )
-        if flowpipes:
-            final_time = float(flowpipes[-1]["time_interval_abs"].upper)
-        else:
-            final_time = float(time_start)
-
-        print(
-            f"DEBUG: Mode '{self.current_mode.name}' - Flow finished with status: {status}. "
-            f"Segments: {len(flowpipes)}. Final t={final_time:.6g}"
-        )
+        
         return flowpipes, status
     
     def _advance_single_step(self, prev_tmv: TMVector, t_step: float, step_idx: int, 
@@ -160,6 +152,7 @@ class ModeSolver(TMReach):
         else:
             # reject step then try to contract
             step_info['is_valid'] = False
+            contracted = None
             if float(h) <= self.min_step * 2:
                 contracted = Intersection.intersect_flowpipe_guard(
                     current_tmv,
@@ -172,9 +165,10 @@ class ModeSolver(TMReach):
                     step_info['tmv'] = contracted
                     step_info['is_valid'] = True
                     self.stop_integration = False
-            if contracted:
+            if contracted is not None:
                 step_info['tmv'] = contracted
                 step_info['is_valid'] = True
+                self.stop_integration = False
 
             else:
                 self.stop_integration = True

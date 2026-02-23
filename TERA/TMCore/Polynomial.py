@@ -52,6 +52,8 @@ class Polynomial:
                 raise ValueError(f"Failed to parse expression '{expr}': {e}")
         else:
             raise ValueError("Must provide a string expression and a tuple of variables.")
+        
+        # various caches to optimize computation speed for repeated operations
         # cache for derivative polynomials used in centered form evaluation
         self._deriv_cache = None
         # cache for monomial terms used in naive range evaluation
@@ -60,6 +62,18 @@ class Polynomial:
         # cache for full range evaluation by domain
         self._range_cache_key = None
         self._range_cache_value = None
+        # small cache for range evaluation of differences
+        self._diff_range_cache = {}
+        self._diff_range_cache_order = []
+        # cache for max exponents per variable
+        self._max_exp_cache = {}
+        # cache for truncate_by_var_index results
+        self._truncate_var_cache = {}
+        # cache of monomial exponents per variable
+        self._var_exp_cache = {}
+        # cache for constant detection
+        self._const_cache_key = None
+        self._const_cache_val = None
 
     # Properties
     @property
@@ -417,6 +431,43 @@ class Polynomial:
 
         return Polynomial(_poly=new_poly_sage, _ring=ring)
 
+    def integrate_truncated_by_var_index(self, int_var_index: int, max_degree: int, start_expr: float = 0.0) -> 'Polynomial':
+        """
+        Integrate the polynomial w.r.t. variable at int_var_index, but only include
+        terms whose exponent in that variable is <= max_degree (Picard-in-time).
+        Equivalent to truncate_by_var_index(int_var_index, max_degree).definite_integral(...),
+        but avoids constructing the intermediate truncated polynomial.
+        """
+        if not (0 <= int_var_index < self.dim):
+            raise ValueError(f"Variable index {int_var_index} out of bounds for dimension {self.dim}.")
+        if max_degree < 0:
+            return Polynomial(_poly=self.ring.zero(), _ring=self.ring)
+
+        ring = self.ring
+        base_ring = ring.base_ring()
+        IntervalOne = base_ring(1)
+        t_start = RIF(start_expr)
+
+        new_poly_sage = ring.zero()
+        for exp_tuple, coeff in self.poly.dict().items():
+            if len(exp_tuple) < len(self.vars):
+                exp_tuple = exp_tuple + (0,) * (len(self.vars) - len(exp_tuple))
+            k = exp_tuple[int_var_index]
+            if k > max_degree:
+                continue
+
+            new_coeff = coeff / (IntervalOne * (k + 1))
+            new_exp_list = list(exp_tuple)
+            new_exp_list[int_var_index] = k + 1
+            new_poly_sage += new_coeff * ring.monomial(*tuple(new_exp_list))
+
+            const_exp_list = list(exp_tuple)
+            const_exp_list[int_var_index] = 0
+            shift_val = new_coeff * (t_start ** (k + 1))
+            new_poly_sage -= shift_val * ring.monomial(*tuple(const_exp_list))
+
+        return Polynomial(_poly=new_poly_sage, _ring=ring)
+
     def truncate(self, max_order: int) -> 'Polynomial':
         """ truncates the polynomial. DISCARDDS higher-order terms
         used in picard operation - not for rigorous truncation"""
@@ -448,45 +499,73 @@ class Polynomial:
         if max_degree < 0:
             return Polynomial(_poly=self.ring.zero(), _ring=self.ring)
 
-        def _as_py_exp(et):
-            try:
-                e = tuple(et)
-            except Exception:
-                try:
-                    e = tuple(et.exponents())
-                except Exception:
-                    try:
-                        e = tuple(et.list())
-                    except Exception:
-                        e = (int(et),)
-            return e
+        # cached truncated polynomial
+        cache_key = (id(self.poly), var_index, max_degree)
+        cached = self._truncate_var_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
-        new_dict = {}
+        d = self.poly.dict()
+        if not d:
+            # zero poly: returning self is fine (immutable semantics assumed)
+            self._truncate_var_cache[cache_key] = self
+            return self
 
+        # univariate case (var_index must be 0)
         if self.dim == 1:
-            for exponent, coeff in self.poly.dict().items():
-                e = _as_py_exp(exponent)
-                if len(e) == 0:
-                    e = (0,)
-                if len(e) > 1:
-                    e = e[:1]
-                if e[0] <= max_degree:
-                    # Keep x^5 * t^1 when truncating by t-degree 1, even if total degree is 6.
-                    new_dict[exponent] = coeff
+            if var_index != 0:
+                raise ValueError("dim==1 implies var_index must be 0.")
+            # keys are ints or () for constant
+            # detect whether truncation actually happens, without extra structures
+            max_exp = 0
+            new_dict = {}
+            has_trunc = False
+            for k, coeff in d.items():
+                e = 0 if k == () else k
+                if e > max_exp:
+                    max_exp = e
+                if e <= max_degree:
+                    new_dict[k] = coeff
+                else:
+                    has_trunc = True
+
+            if not has_trunc:
+                self._truncate_var_cache[cache_key] = self
+                self._max_exp_cache[var_index] = max_exp
+                return self
+
+            res = Polynomial(_poly=self.ring(new_dict), _ring=self.ring)
+
+        # multivariate case
         else:
-            for exp_tuple, coeff in self.poly.dict().items():
-                e = _as_py_exp(exp_tuple)
-                if len(e) == 0:
-                    e = (0,) * self.dim
-                elif len(e) < self.dim:
-                    e = e + (0,) * (self.dim - len(e))
-                elif len(e) > self.dim:
-                    e = e[:self.dim]
+            # keys are tuples length dim, or () for constant
+            has_trunc = False
+            max_exp = 0
+            new_dict = {}
+            for exp, coeff in d.items():
+                if exp == ():
+                    e = 0
+                else:
+                    # exp is tuple length dim
+                    e = exp[var_index]
+                if e > max_exp:
+                    max_exp = e
+                if e <= max_degree:
+                    new_dict[exp] = coeff
+                else:
+                    has_trunc = True
 
-                if e[var_index] <= max_degree:
-                    new_dict[exp_tuple] = coeff
+            if not has_trunc:
+                self._truncate_var_cache[cache_key] = self
+                self._max_exp_cache[var_index] = max_exp
+                return self
 
-        return Polynomial(_poly=self.ring(new_dict), _ring=self.ring)
+            res = Polynomial(_poly=self.ring(new_dict), _ring=self.ring)
+
+        if len(self._truncate_var_cache) < 16:
+            self._truncate_var_cache[cache_key] = res
+        self._max_exp_cache[var_index] = max_exp
+        return res
 
     # Utils
     def __str__(self):
@@ -506,6 +585,43 @@ class Polynomial:
         const_val = self.poly.constant_coefficient()
         
         return Interval(const_val)
+
+    def constant_coeff_if_constant(self):
+        """Return constant coefficient if polynomial is constant, else None."""
+        key = id(self.poly)
+        if self._const_cache_key == key:
+            return self._const_cache_val
+        d = self.poly.dict()
+        if len(d) != 1:
+            self._const_cache_key = key
+            self._const_cache_val = None
+            return None
+        (k, coeff) = next(iter(d.items()))
+        # determine exponent tuple safely
+        try:
+            exps = tuple(k)
+        except Exception:
+            try:
+                exps = tuple(k.list())
+            except Exception:
+                try:
+                    exps = (int(k),)
+                except Exception:
+                    exps = ()
+
+        if self.dim == 1:
+            if (len(exps) == 0) or (len(exps) == 1 and exps[0] == 0):
+                self._const_cache_key = key
+                self._const_cache_val = coeff
+                return coeff
+        else:
+            if len(exps) == 0 or all(e == 0 for e in exps):
+                self._const_cache_key = key
+                self._const_cache_val = coeff
+                return coeff
+        self._const_cache_key = key
+        self._const_cache_val = None
+        return None
 
 
 def bound_monomial(coeff, exponents, domain) -> Interval:

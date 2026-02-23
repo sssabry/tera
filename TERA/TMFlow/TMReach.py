@@ -7,9 +7,6 @@ from sage.all import fast_callable, SR, PolynomialRing, RIF, vector, matrix, jac
 import copy
 from tqdm.auto import tqdm
 from typing import List, Callable, Tuple, Optional
-import time
-from contextlib import contextmanager
-from collections import defaultdict
 
 from TERA.TMCore.Interval import Interval
 from TERA.TMCore.Polynomial import Polynomial
@@ -68,10 +65,6 @@ class TMReach:
         self._id_prev_center = None
         self._id_prev_scales = None
 
-        # profiling stats
-        self.profile_times = defaultdict(float)
-        self.profile_counts = defaultdict(int)
-
         # progress bar toggle
         self.progress_bar = progress_bar
 
@@ -88,134 +81,126 @@ class TMReach:
         else:
             self.current_remainder_guess = remainder_estimation
 
-    @contextmanager
-    def _measure(self, name: str):
-        """timing context manager for speed profiling"""
-        t0 = time.perf_counter()
-        try:
-            yield
-        finally:
-            dt = time.perf_counter() - t0
-            self.profile_times[name] += dt
-            self.profile_counts[name] += 1
-
-    def print_profile_report(self):
-        print(f"\n{'='*50}")
-        print(f"{'Section Name':<30} | {'Calls':<8} | {'Total (s)':<10} | {'Avg (ms)':<10}")
-        print(f"{'-'*50}")
-        
-        # sort by total time descending
-        sorted_stats = sorted(self.profile_times.items(), key=lambda x: x[1], reverse=True)
-        
-        for name, total_time in sorted_stats:
-            count = self.profile_counts[name]
-            avg_ms = (total_time / count) * 1000 if count > 0 else 0
-            print(f"{name:<30} | {count:<8} | {total_time:<10.4f} | {avg_ms:<10.2f}")
-        print(f"{'='*50}\n")
-
     def _generate_ode_evaluator(self, ode_exprs: List, vars: List) -> Callable[[TMVector], TMVector]:
         """
         compiles the symbolic ODE expressions into a callable function that supports TM arithmetic
 
         20/11 modification - testing lambda based mapping to TaylorModel class's intrinsic funcs
         """
-        # wrapper functions to dispatch based on input type
-        # makes sure sin(TM) calls TM.sin() & sin(float) calls math.sin()
-        def _sin(x):
-            return x.sin() if hasattr(x, 'sin') else sin(x)
+        def _sin(x): return x.sin() if hasattr(x, 'sin') else sin(x)
+        def _cos(x): return x.cos() if hasattr(x, 'cos') else cos(x)
+        def _exp(x): return x.exp() if hasattr(x, 'exp') else exp(x)
 
-        def _cos(x):
-            return x.cos() if hasattr(x, 'cos') else cos(x)
+        context = {'sin': _sin, 'cos': _cos, 'exp': _exp, 'log': log}
 
-        def _exp(x):
-            return x.exp() if hasattr(x, 'exp') else exp(x)
-            
-        context = {
-            'sin': _sin,
-            'cos': _cos,
-            'exp': _exp,
-            'log': log, 
-        }
         var_names = [str(v) for v in vars]
         time_var = self.time_var
         lambda_args = ", ".join(var_names + [time_var])
 
-        time_sym = SR.var(self.time_var)
-        uses_time = any(bool(expr.has(time_sym)) for expr in ode_exprs)
+        uses_time = any(time_var in str(expr) for expr in ode_exprs)
+        if not uses_time:
+            time_sym = SR.var(time_var)
+            uses_time = any(bool(expr.has(time_sym)) for expr in ode_exprs)
 
-        # uses fast_callable for speed of compilation
-        compiled_funcs = []
-        for expr in ode_exprs:
-            # fast_callable works with python objects that support arithmetic (like TMVector/TaylorModel)
-            expr_str = str(expr)
-            expr_str = expr_str.replace('^', '**')
+        expr_strs = []
+        const_exprs = []
+        nonconst_indices = []
 
-            # create lambda source to implement intrinsic wrapping
-            lambda_src = f"lambda {lambda_args}: {expr_str}"
+        for idx, expr in enumerate(ode_exprs):
+            expr_str = str(expr).replace('^', '**')
 
+            is_const = False
+            const_val = None
             try:
-                func = eval(lambda_src, context)
-                compiled_funcs.append(func)
-            except Exception as e:
-                raise RuntimeError(f"Failed to compile ODE expression '{expr}': {e}")
-            # f_fast = fast_callable(expr, vars=vars) 
-            # compiled_funcs.append(f_fast)
+                if hasattr(expr, "is_constant") and expr.is_constant():
+                    is_const = True
+            except Exception:
+                is_const = False
+
+            if is_const:
+                try:
+                    const_val = float(expr)
+                except Exception:
+                    try:
+                        const_val = float(SR(expr))
+                    except Exception:
+                        is_const = False
+
+            if is_const:
+                const_exprs.append((idx, const_val))
+            else:
+                expr_strs.append(expr_str)
+                nonconst_indices.append(idx)
+
+        n_vars = len(vars)
+        n_expected = n_vars + 1
+
+        tuple_func = None
+        if len(expr_strs) == 1:
+            tuple_src = f"lambda {lambda_args}: ({expr_strs[0]},)"
+        elif len(expr_strs) > 1:
+            tuple_src = f"lambda {lambda_args}: ({', '.join(expr_strs)})"
+        else:
+            tuple_src = None
+        if tuple_src is not None:
+            tuple_func = eval(tuple_src, context)
+
+        # Persistent caches across RHS calls
+        time_tm_cache = {}     # key -> TaylorModel
+        const_tm_cache = {}    # (tmpl_key, value) -> TaylorModel
+
+        def _template_key(template_tm: TaylorModel):
+            dom = template_tm.domain
+            domain_sig = tuple((iv.lower, iv.upper) for iv in dom)
+            return (id(template_tm.poly.ring), template_tm.max_order, domain_sig, template_tm.ref_point)
+
+        def _const_tm(val, template_tm: TaylorModel):
+            key = (_template_key(template_tm), float(val))
+            tm = const_tm_cache.get(key)
+            if tm is None:
+                tm = TaylorModel.from_constant(float(val), template_tm)
+                const_tm_cache[key] = tm
+            return tm
 
         def evaluator(tm_vec: TMVector) -> TMVector:
-            """
-            evaluates f(tm_vec) using the compiled functions
-
-            might contain 't' (if the ODE is time varying)
-            """
-            
-            # extract tms to pass as arguments
             args = tm_vec.tms
+            template_tm = args[0]
 
-            # ensure time variable is available for time-varying dynamics
-            if len(args) == len(vars):
+            # ensure time is present if needed
+            if len(args) == n_vars:
                 if uses_time:
-                    # non-autonomous ODE: MUST have time var. raise error
                     return None
-                try:
-                    time_tm = TaylorModel.from_constant(0.0, args[0])
-                    args = list(args) + [time_tm]
-                except Exception:
-                    args = list(args)
-            
-            # if the input vector is larger than the symbolic vars list: slice args to match vars
-            if len(args) > len(vars) + 1:
-                args = args[:len(vars) + 1]
-            
-            result_tms = []
-            
-            # use first as template
-            template_tm = tm_vec.tms[0]
+                # autonomous: supply t=0 TM, cached
+                tkey = _template_key(template_tm)
+                time_tm = time_tm_cache.get(tkey)
+                if time_tm is None:
+                    time_tm = TaylorModel.from_constant(0.0, template_tm)
+                    time_tm_cache[tkey] = time_tm
+                args = list(args) + [time_tm]  # no copy
 
-            for f_func in compiled_funcs:
-                # evaluates by calling on TMVector/TaylorModel's operator overrides
+            if len(args) > n_expected:
+                args = args[:n_expected]
+
+            result_tms = [None] * len(ode_exprs)
+
+            # non-constant exprs
+            if tuple_func is not None and nonconst_indices:
                 try:
-                    res = f_func(*args)
-                except ZeroDivisionError as exc:
-                    print(f"[DBG][ode_rhs][ZeroDivisionError] expr={f_func} exc={exc}")
+                    res_tuple = tuple_func(*args)
+                except ZeroDivisionError:
                     return None
 
-                
-                # check if result is a TaylorModel (or TM-like object)
-                if hasattr(res, 'poly') and hasattr(res, 'remainder'):
-                    result_tms.append(res)
-                else:
-                    # result is a scalar constant -> promote it to a constant TM
-                    var_names_str = template_tm.poly.ring.variable_names()
-                    constant_tm = init_taylor_model(
-                        my_func=res,
-                        var_names=var_names_str,
-                        domains=template_tm.domain,
-                        order=template_tm.max_order,
-                        ref_point=template_tm.ref_point,
-                        expand_function=False
-                    )
-                    result_tms.append(constant_tm)
-            
+                for j, res in enumerate(res_tuple):
+                    idx = nonconst_indices[j]
+                    if hasattr(res, 'poly') and hasattr(res, 'remainder'):
+                        result_tms[idx] = res
+                    else:
+                        result_tms[idx] = _const_tm(res, template_tm)
+
+            # constant exprs (symbolically constant ODE components)
+            for idx, cval in const_exprs:
+                result_tms[idx] = _const_tm(cval, template_tm)
+
             return TMVector(result_tms)
 
         return evaluator
@@ -401,8 +386,7 @@ class TMReach:
                 h = time_end - t_current
             
             # attempt a reachability step
-            with self._measure("Full Step (Single)"):
-                result = self._advance_single_step(current_tmv, h, step_count, self.current_remainder_guess, t_current, current_order, retrying=retrying_step)
+            result = self._advance_single_step(current_tmv, h, step_count, self.current_remainder_guess, t_current, current_order, retrying=retrying_step)
 
             if result['success']:
                 retrying_step = False
@@ -418,18 +402,16 @@ class TMReach:
                 step_info['time_interval_abs'] = Interval(t_start, t_end)
                 
                 # send data to observer classes
-                with self._measure("Post Step Hook"):
-                    self._post_step_hook(step_info, h)
+                self._post_step_hook(step_info, h)
 
-                    if getattr(self, 'stop_integration', False):
-                        status = "TERMINATED_BY_HOOK"
-                        break
+                if getattr(self, 'stop_integration', False):
+                    status = "TERMINATED_BY_HOOK"
+                    break
 
                 flowpipe_data.append(step_info)
                 
                 # update state
-                with self._measure("Eval at t_end"):
-                    current_tmv = Precondition.evaluate_at_t_end(final_tmv, h, self.time_var)
+                current_tmv = Precondition.evaluate_at_t_end(final_tmv, h, self.time_var)
                 
                 t_current = t_end
                 step_count += 1
@@ -498,13 +480,12 @@ class TMReach:
         local_inv_scales = inv_scales[:state_dim]
 
         # 1. POLYNOMIAL FLOW
-        with self._measure("Integrate: Picard"):
-            poly_flow_tmv = Picard.compute_polynomial_flowpipe(
-                x0=x0_tmv,
-                ode_rhs=self.ode_rhs,
-                order=current_order,
-                cutoff_threshold=self.cutoff_threshold,
-            )
+        poly_flow_tmv = Picard.compute_polynomial_flowpipe(
+            x0=x0_tmv,
+            ode_rhs=self.ode_rhs,
+            order=current_order,
+            cutoff_threshold=self.cutoff_threshold,
+        )
 
         if poly_flow_tmv is None:
             return {
@@ -515,21 +496,20 @@ class TMReach:
 
         # 2. REMAINDER VERIFICATION LOOP
         # a. evaluate J over the "rough" enclosure of the flowpipe from (1)
-        with self._measure("Integrate: Jacobian"):
-            poly_bounds = poly_flow_tmv.bound()
+        poly_bounds = poly_flow_tmv.bound()
 
-            # inflate by largest remainder guess & construct boz that covers likely flow
-            eval_box = []
-            for i in range(state_dim):
-                rad = local_rem_guess[i].radius()
+        # inflate by largest remainder guess & construct boz that covers likely flow
+        eval_box = []
+        for i in range(state_dim):
+            rad = local_rem_guess[i].radius()
 
-                inflated_interval = poly_bounds[i] + Interval(-rad, rad)
-                eval_box.append(inflated_interval)
+            inflated_interval = poly_bounds[i] + Interval(-rad, rad)
+            eval_box.append(inflated_interval)
 
-            jacobian_matrix = self.jacobian_evaluator(eval_box)
-            if jacobian_matrix is None:
-                # if cannot bound jacobian (e.g singularity/undefined) fail gracefully so adaptive logic can retyr
-                return {'success': False, 'inflated': True}
+        jacobian_matrix = self.jacobian_evaluator(eval_box)
+        if jacobian_matrix is None:
+            # if cannot bound jacobian (e.g singularity/undefined) fail gracefully so adaptive logic can retyr
+            return {'success': False, 'inflated': True}
 
 
         current_guess_intervals = local_rem_guess
@@ -538,101 +518,102 @@ class TMReach:
         # extract only state dimensions for the center vector
         c_l = [float(tm.poly.poly.constant_coefficient()) for tm in x0_tmv.tms[:state_dim]]
 
+        trunc_errors_cache = None
         for attempt in range(max_attempts):
-            with self._measure("Integrate: Remainder Loop"):
-                # prepare guess tmv
-                scaled_estimation = []
-                min_normalized_rem = 1e-12 
+            # prepare guess tmv
+            scaled_estimation = []
+            min_normalized_rem = 1e-12 
                 
-                for i in range(state_dim):
-                    interval = current_guess_intervals[i]
-                    scaled_est_rad = interval.radius() * local_inv_scales[i]
-                    effective_rad = max(scaled_est_rad, 1e-12)
-                    scaled_estimation.append(Interval(-effective_rad, effective_rad))
+            for i in range(state_dim):
+                interval = current_guess_intervals[i]
+                scaled_est_rad = interval.radius() * local_inv_scales[i]
+                effective_rad = max(scaled_est_rad, 1e-12)
+                scaled_estimation.append(Interval(-effective_rad, effective_rad))
 
-                if len(scaled_estimation) != self.state_dim:
-                    scaled_estimation = scaled_estimation[:self.state_dim]
-                # keep full poly_flow_tmv (state + time if present) 
-                full_poly_flow_tmv = poly_flow_tmv
-                guess_tmv = Remainder.compute_initial_guess(
-                    current_tmv=full_poly_flow_tmv,
-                    remainder_estimation=scaled_estimation,
-                    state_dim=state_dim
+            if len(scaled_estimation) != self.state_dim:
+                scaled_estimation = scaled_estimation[:self.state_dim]
+            # keep full poly_flow_tmv (state + time if present) 
+            full_poly_flow_tmv = poly_flow_tmv
+            guess_tmv = Remainder.compute_initial_guess(
+                current_tmv=full_poly_flow_tmv,
+                remainder_estimation=scaled_estimation,
+                state_dim=state_dim
+            )
+                
+            # verify
+            success, verified_tmv, trunc_errors = Remainder.verify_remainder(
+                guess_tmv=guess_tmv, x0=x0_tmv, ode_rhs=self.ode_rhs, 
+                time_var=self.time_var, time_step=time_interval, time_start=time_start,
+                order=current_order, cutoff_threshold=self.cutoff_threshold,
+                state_dim=state_dim,
+                precomputed_truncation_errors=trunc_errors_cache
+            )
+            if trunc_errors_cache is None and trunc_errors is not None:
+                trunc_errors_cache = trunc_errors
+
+            if verified_tmv is None:
+                return {
+                    'success': False,
+                    'inflated': inflated,
+                    'needs_smaller_step': True,
+                    'reason': 'PICARD_EVAL_FAILED'
+                }
+
+            if success:
+                # take snapshot of verified rems to propagate as next guess
+                verified_rems_snapshot = [
+                    Interval(tm.remainder.lower, tm.remainder.upper)
+                    for tm in verified_tmv.tms[:state_dim]
+                ]
+                # refine
+                verified_state = TMVector(verified_tmv.tms[:state_dim])
+                x0_state = TMVector(x0_tmv.tms[:state_dim])
+                final_tmv = Remainder.refine_remainder(
+                    verified_tmv=verified_state, x0=x0_state, ode_rhs=self.ode_rhs, 
+                    time_var=self.time_var, time_step=time_interval, 
+                    order=current_order, truncation_errors=trunc_errors, 
+                    max_refinements=self.max_iterations, jacobian=jacobian_matrix
                 )
-                
-                # verify
-                with self._measure("Integrate: Verify"):
-                    success, verified_tmv, trunc_errors = Remainder.verify_remainder(
-                        guess_tmv=guess_tmv, x0=x0_tmv, ode_rhs=self.ode_rhs, 
-                        time_var=self.time_var, time_step=time_interval, time_start=time_start,
-                        order=current_order, cutoff_threshold=self.cutoff_threshold,
-                        state_dim=state_dim
-                    )
-
-                if verified_tmv is None:
-                    return {
-                        'success': False,
-                        'inflated': inflated,
-                        'needs_smaller_step': True,
-                        'reason': 'PICARD_EVAL_FAILED'
-                    }
-
-                if success:
-                    # take snapshot of verified rems to propagate as next guess
-                    verified_rems_snapshot = [
-                        Interval(tm.remainder.lower, tm.remainder.upper)
-                        for tm in verified_tmv.tms[:state_dim]
-                    ]
-                    # refine
-                    with self._measure("Integrate: Refine"):
-                        verified_state = TMVector(verified_tmv.tms[:state_dim])
-                        x0_state = TMVector(x0_tmv.tms[:state_dim])
-                        final_tmv = Remainder.refine_remainder(
-                            verified_tmv=verified_state, x0=x0_state, ode_rhs=self.ode_rhs, 
-                            time_var=self.time_var, time_step=time_interval, 
-                            order=current_order, truncation_errors=trunc_errors, 
-                            max_refinements=self.max_iterations, jacobian=jacobian_matrix
-                        )
                     
-                    return {
-                        'success': True, 
-                        'tmv': final_tmv, 
-                        'verified_tmv': verified_tmv,
-                        'verified_rems_snapshot': verified_rems_snapshot,
-                        'c_l': c_l,
-                        'inflated': inflated,
-                        'jacobian': jacobian_matrix,
-                        'order_used': current_order
-                    }
-                else:
-                    # verififcation failed? computed error > guess -> 
-                    # use the computed error from the failed check as the new guess
+                return {
+                    'success': True, 
+                    'tmv': final_tmv, 
+                    'verified_tmv': verified_tmv,
+                    'verified_rems_snapshot': verified_rems_snapshot,
+                    'c_l': c_l,
+                    'inflated': inflated,
+                    'jacobian': jacobian_matrix,
+                    'order_used': current_order
+                }
+            else:
+                # verififcation failed? computed error > guess -> 
+                # use the computed error from the failed check as the new guess
 
-                    # make sure it hasnt exploded
-                    if any(tm.remainder.is_nan for tm in verified_tmv.tms):
-                        break 
+                # make sure it hasnt exploded
+                if any(tm.remainder.is_nan for tm in verified_tmv.tms):
+                    break 
                     
-                    # convert computed remainder to global scale & multiply by safety factor
-                    new_guess = []
+                # convert computed remainder to global scale & multiply by safety factor
+                new_guess = []
 
-                    MAX_SCALE_WARN = 1e20
-                    SAFETY = 2.0
-                    for i in range(state_dim):
-                        norm_rad = verified_tmv.tms[i].remainder.radius()
-                        raw_rad = norm_rad / local_inv_scales[i] if local_inv_scales[i] != 0 else float('inf')
-                        # keep raw guess consistent with normalized minimum remainder radius (1e-12)
-                        raw_min = 1e-12 / local_inv_scales[i] if local_inv_scales[i] != 0 else 1e-12
-                        raw_rad = max(float(raw_rad), float(raw_min))
-                        # propose new guess in normalized coordinates (same space as current_guess_intervals)
-                        ng = Interval(-SAFETY * raw_rad, SAFETY * raw_rad)
+                MAX_SCALE_WARN = 1e20
+                SAFETY = 2.0
+                for i in range(state_dim):
+                    norm_rad = verified_tmv.tms[i].remainder.radius()
+                    raw_rad = norm_rad / local_inv_scales[i] if local_inv_scales[i] != 0 else float('inf')
+                    # keep raw guess consistent with normalized minimum remainder radius (1e-12)
+                    raw_min = 1e-12 / local_inv_scales[i] if local_inv_scales[i] != 0 else 1e-12
+                    raw_rad = max(float(raw_rad), float(raw_min))
+                    # propose new guess in normalized coordinates (same space as current_guess_intervals)
+                    ng = Interval(-SAFETY * raw_rad, SAFETY * raw_rad)
 
-                        S_val = 1.0 / local_inv_scales[i] if local_inv_scales[i] != 0 else float('inf')
-                        if not math.isfinite(S_val) or abs(S_val) > MAX_SCALE_WARN:
-                            return {'success': False, 'inflated': True}
-                        new_guess.append(ng)
+                    S_val = 1.0 / local_inv_scales[i] if local_inv_scales[i] != 0 else float('inf')
+                    if not math.isfinite(S_val) or abs(S_val) > MAX_SCALE_WARN:
+                        return {'success': False, 'inflated': True}
+                    new_guess.append(ng)
                     
-                    current_guess_intervals = new_guess
-                    inflated = True
+                current_guess_intervals = new_guess
+                inflated = True
 
         return {'success': False, 'inflated': inflated}
 
@@ -648,8 +629,7 @@ class TMReach:
         normalized_domain = [Interval(-1.0, 1.0) for _ in range(state_dimension)]
 
         # determine center & shift
-        with self._measure("Coords: Shift"):
-            tmv_deviation, center_c0 = Precondition.shift_to_origin(target_tmv)
+        tmv_deviation, center_c0 = Precondition.shift_to_origin(target_tmv)
         
         # slice if time already injected
         if dimension > state_dimension:
@@ -668,16 +648,15 @@ class TMReach:
         A_lin_inv = None
 
         if self.preconditioning == "QR":
-            with self._measure("Coords: QR"):
-                x0_new, scales, inv_scales, _, Q_matrix = Precondition.qr_preconditioning(
-                    tmv_pre=target_tmv,
-                    t_step=t_step,
-                    current_domain=target_tmv.domain,
-                    time_var=self.time_var,
-                    var_names=self.var_names,
-                    time_start=t_global_start,
-                    state_dim=state_dimension
-                )
+            x0_new, scales, inv_scales, _, Q_matrix = Precondition.qr_preconditioning(
+                tmv_pre=target_tmv,
+                t_step=t_step,
+                current_domain=target_tmv.domain,
+                time_var=self.time_var,
+                var_names=self.var_names,
+                time_start=t_global_start,
+                state_dim=state_dimension
+            )
 
             s_min = 1e-6
             scales = [max(s, s_min) for s in scales]
@@ -850,19 +829,18 @@ class TMReach:
                 range_of_x0 = Precondition.determine_magnitude(state_deviation, state_domain)
                 desired = [max(float(iv.radius()), 1e-16) for iv in range_of_x0]
                 scales_now = [float(s) for s in desired]
-            with self._measure("Coords: Construct ID"):
-                time_interval = Interval(t_global_start, t_global_start + t_step)
-                local_time_interval = Interval(0.0, t_step)
-                x0_new = Precondition.construct_new_initial_vars(
-                    state_dimension=state_dimension, 
-                    scale_factors_S=scales, 
-                    center_c0=center_c0[:state_dimension], 
-                    max_order=self.order,
-                    time_domain=local_time_interval,
-                    var_names=self.var_names,
-                    time_start=0.0
-                )
-                x0_new.domain = normalized_domain + [local_time_interval]
+            time_interval = Interval(t_global_start, t_global_start + t_step)
+            local_time_interval = Interval(0.0, t_step)
+            x0_new = Precondition.construct_new_initial_vars(
+                state_dimension=state_dimension, 
+                scale_factors_S=scales, 
+                center_c0=center_c0[:state_dimension], 
+                max_order=self.order,
+                time_domain=local_time_interval,
+                var_names=self.var_names,
+                time_start=0.0
+            )
+            x0_new.domain = normalized_domain + [local_time_interval]
 
             # preserve off-diagonal coupling only under conservative stagnation trigger
             if use_full_linear and stagnating and (J_off is not None):
@@ -921,23 +899,21 @@ class TMReach:
             coords = self._coords_cache
         
         else:
-            with self._measure("Compute Local Coords"):
-                coords = self._compute_local_coordinates(prev_tmv, t_step, step_idx, time_start, retrying=retrying)
-                self._coords_cache_step = step_idx
-                self._coords_cache = coords
+            coords = self._compute_local_coordinates(prev_tmv, t_step, step_idx, time_start, retrying=retrying)
+            self._coords_cache_step = step_idx
+            self._coords_cache = coords
 
         # 2. integrate
-        with self._measure("Integrate Local Flow"):
-            result = self._integrate_local_flow(
-                x0_tmv=coords['x0_new'], 
-                t_step=t_step, 
-                rem_guess=rem_guess,
-                inv_scales=coords['inv_scales'],
-                # respect fixed step mode constraints for retries
-                max_attempts=1 if self.fixed_step_mode else 2,
-                time_start=time_start,
-                current_order=current_order
-            )
+        result = self._integrate_local_flow(
+            x0_tmv=coords['x0_new'], 
+            t_step=t_step, 
+            rem_guess=rem_guess,
+            inv_scales=coords['inv_scales'],
+            # respect fixed step mode constraints for retries
+            max_attempts=1 if self.fixed_step_mode else 2,
+            time_start=time_start,
+            current_order=current_order
+        )
         
         # 3. package result
         if result['success']:
@@ -1041,20 +1017,18 @@ class TMReach:
                 h = time_end - t_current
 
             # perform the step
-            with self._measure("Full Step (L-R)"):
-                result = self._advance_left_right_step(left_tmv, right_tmv, h, time_start, current_order, step_idx=len(flowpipe_data))
+            result = self._advance_left_right_step(left_tmv, right_tmv, h, time_start, current_order, step_idx=len(flowpipe_data))
 
             if result['success']:
                 # successful? update state for next step
                 
-                with self._measure("Vis Composition"):
-                    composite_tmv = self._construct_visualization_tm(
-                        L_integrated=result['L_integrated'],
-                        L_next=result['L_next'],
-                        R_prev=right_tmv,
-                        h=h,
-                        t_current=t_current
-                    )
+                composite_tmv = self._construct_visualization_tm(
+                    L_integrated=result['L_integrated'],
+                    L_next=result['L_next'],
+                    R_prev=right_tmv,
+                    h=h,
+                    t_current=t_current
+                )
 
                 step_info = {
                     'tmv': composite_tmv, 
@@ -1071,12 +1045,11 @@ class TMReach:
                 right_tmv = result['R_next']
 
                 # send data to observer classes
-                with self._measure("Post Step Hook"):
-                    self._post_step_hook(step_info, h)
+                self._post_step_hook(step_info, h)
 
-                    if getattr(self, 'stop_integration', False):
-                        status = "TERMINATED_BY_HOOK"
-                        break
+                if getattr(self, 'stop_integration', False):
+                    status = "TERMINATED_BY_HOOK"
+                    break
 
                 t_current += h
                 if self.progress_bar:
@@ -1129,7 +1102,7 @@ class TMReach:
         scales = [b.radius() for b in l_bounds]
         inv_scales = [(1.0 if s < 1e-12 else 1.0 / s) for s in scales]
 
-        L_integration = copy.deepcopy(L_prev)
+        L_integration = L_prev.copy()
 
         integration_time_domain = Interval(0, h)
         # adjust time domain for all tms
@@ -1142,16 +1115,15 @@ class TMReach:
             rp[-1] = 0.0
             tm.ref_point = tuple(rp)
         
-        with self._measure("Integrate Local Flow"):
-            int_result = self._integrate_local_flow(
-                x0_tmv=L_integration,
-                t_step=h,
-                rem_guess=rem_guess,
-                inv_scales=inv_scales,
-                time_start=0.0,
-                max_attempts=3,
-                current_order=current_order
-            )
+        int_result = self._integrate_local_flow(
+            x0_tmv=L_integration,
+            t_step=h,
+            rem_guess=rem_guess,
+            inv_scales=inv_scales,
+            time_start=0.0,
+            max_attempts=3,
+            current_order=current_order
+        )
 
         if not int_result['success']:
             return {'success': False}
@@ -1161,16 +1133,15 @@ class TMReach:
 
         # 2. decompose the flow
         try:
-            with self._measure("L-R: Decompose"):
-                M_flow = Precondition.evaluate_at_t_end(L_integrated, float(h), self.time_var)
-                # shift (extract center c0 and deviation M_centered = M_flow - c0)
-                M_centered, center_c = Precondition.shift_to_origin(M_flow)
+            M_flow = Precondition.evaluate_at_t_end(L_integrated, float(h), self.time_var)
+            # shift (extract center c0 and deviation M_centered = M_flow - c0)
+            M_centered, center_c = Precondition.shift_to_origin(M_flow)
 
-                A_full = M_centered.get_jacobian()
-                A = A_full[:state_dim, :state_dim]
+            A_full = M_centered.get_jacobian()
+            A = A_full[:state_dim, :state_dim]
 
-                Q = Precondition.compute_qr_matrix(A)
-                Q_poly = Precondition.rotate_tmv(M_centered, Q)
+            Q = Precondition.compute_qr_matrix(A)
+            Q_poly = Precondition.rotate_tmv(M_centered, Q)
 
         except Exception as e:
             print(f"DEBUG: Decomposition crashed: {e}")
@@ -1178,219 +1149,194 @@ class TMReach:
 
         # 3. perform shrink wrapping step w/ composition
         try:
-            with self._measure("L-R: Composition"):
-                Q_poly_state = TMVector(Q_poly.tms[:state_dim])
+            Q_poly_state = TMVector(Q_poly.tms[:state_dim])
 
-                time_tm = TaylorModel.from_constant(0.0, R_prev.tms[0])
+            time_tm = TaylorModel.from_constant(0.0, R_prev.tms[0])
 
-                replacements = [copy.deepcopy(tm) for tm in R_prev.tms[:state_dim]] + [time_tm]
-                for tm in replacements:
-                    tm.domain = copy.deepcopy(R_prev.domain)
-                    tm.ref_point = copy.deepcopy(R_prev.ref_point)
+            replacements = [tm.copy() for tm in R_prev.tms[:state_dim]] + [time_tm]
+            for tm in replacements:
+                tm.domain = list(R_prev.domain)
+                tm.ref_point = tuple(R_prev.ref_point)
 
-                T_state = Q_poly_state.compose(replacements)
-                if self.shrink_wrap_mode:
-                    sw_verbose = getattr(self, "verbose", False)
-                    sw = Precondition.shrink_wrap_corrected(
-                        T_state,
-                        time_var=self.time_var,
-                        slack_q=1e-12,
-                        max_iter=10,
-                        q_cap=1.2,
-                        use_preconditioning=True,
-                        verbose=sw_verbose
-                    )
-                    if sw.get('success', False):
-                        T_state = sw['T_sw']
-                        if sw_verbose and sw.get('warn') == 'SANITY_FAIL':
-                            print("L/R shrink wrap warning: SANITY_FAIL")
-                    else:
-                        if sw_verbose:
-                            print(f"L/R shrink wrap skipped: {sw.get('reason', 'UNKNOWN')}")
-                T_target = TMVector(list(T_state.tms) + [copy.deepcopy(R_prev.tms[-1])])
+            T_state = Q_poly_state.compose(replacements)
+            if self.shrink_wrap_mode:
+                sw_verbose = getattr(self, "verbose", False)
+                sw = Precondition.shrink_wrap_corrected(
+                    T_state,
+                    time_var=self.time_var,
+                    slack_q=1e-12,
+                    max_iter=10,
+                    q_cap=1.2,
+                    use_preconditioning=True,
+                    verbose=sw_verbose
+                )
+                if sw.get('success', False):
+                    T_state = sw['T_sw']
+                    if sw_verbose and sw.get('warn') == 'SANITY_FAIL':
+                        print("L/R shrink wrap warning: SANITY_FAIL")
+                else:
+                    if sw_verbose:
+                        print(f"L/R shrink wrap skipped: {sw.get('reason', 'UNKNOWN')}")
+            T_target = TMVector(list(T_state.tms) + [R_prev.tms[-1].copy()])
 
         except Exception as e:
             print(f"DEBUG: Composition crashed: {e}")
             return {'success': False}
 
         # 4. scale to normalized domain
-        with self._measure("L-R: Normalize"):
-            range_of_yr = T_state.bound()  # list[Interval] length = state_dim
-            midpoints_m = [iv.midpoint() for iv in range_of_yr]
-            scale_factors_S = []
-            inv_scale_factors_S = []
+        range_of_yr = T_state.bound()  # list[Interval] length = state_dim
+        midpoints_m = [iv.midpoint() for iv in range_of_yr]
+        scale_factors_S = []
+        inv_scale_factors_S = []
 
-            MIN_RAD = 1e-14
-            for iv in range_of_yr:
-                rad = iv.radius()
-                rad = float(rad)
-                if rad < MIN_RAD:
-                    rad = MIN_RAD
-                scale_factors_S.append(rad)
-                inv_scale_factors_S.append(1.0 / rad)
+        MIN_RAD = 1e-14
+        for iv in range_of_yr:
+            rad = iv.radius()
+            rad = float(rad)
+            if rad < MIN_RAD:
+                rad = MIN_RAD
+            scale_factors_S.append(rad)
+            inv_scale_factors_S.append(1.0 / rad)
 
-            # 5. construct left/right models for next step
-            R_next = Precondition.normalize_right_model(
-                tm_target=T_target,
-                midpoints_m=midpoints_m,
-                inv_scale_factors_S=inv_scale_factors_S
-            )
+        # 5. construct left/right models for next step
+        R_next = Precondition.normalize_right_model(
+            tm_target=T_target,
+            midpoints_m=midpoints_m,
+            inv_scale_factors_S=inv_scale_factors_S
+        )
 
-            next_time_domain_local = Interval(0.0, 0.0)
-            norm_domain = [Interval(-1.0, 1.0)] * state_dim + [next_time_domain_local]
+        next_time_domain_local = Interval(0.0, 0.0)
+        norm_domain = [Interval(-1.0, 1.0)] * state_dim + [next_time_domain_local]
 
-            L_next = Precondition.construct_affine_left_model(
-                dimension=state_dim,
-                Q=Q,
-                scale_factors_S=scale_factors_S,
-                midpoints_m=midpoints_m,
-                center_c0=center_c,
-                max_order=self.order,
-                domain=norm_domain,
-                time_start=0.0,
-                var_names=self.var_names
-            )
+        L_next = Precondition.construct_affine_left_model(
+            dimension=state_dim,
+            Q=Q,
+            scale_factors_S=scale_factors_S,
+            midpoints_m=midpoints_m,
+            center_c0=center_c,
+            max_order=self.order,
+            domain=norm_domain,
+            time_start=0.0,
+            var_names=self.var_names
+        )
 
+        try:
+            t_abs_current = float(R_prev.domain[-1].lower)
+        except Exception:
+            t_abs_current = 0.0
+
+        t_abs_next = t_abs_current + float(h)
+
+        # enforce absolute time in R_next
+        for tm in R_next.tms:
+            dom = list(tm.domain)
+            rp = list(tm.ref_point)
+            if len(dom) < state_dim + 1:
+                dom = dom + [Interval(0.0, 0.0)] * ((state_dim + 1) - len(dom))
+            if len(rp) < state_dim + 1:
+                rp = rp + [0.0] * ((state_dim + 1) - len(rp))
+            dom[-1] = Interval(t_abs_next, t_abs_next)
+            rp[-1] = t_abs_next
+            tm.domain = dom
+            tm.ref_point = tuple(rp)
+
+        R_next.domain = list(R_next.tms[0].domain)
+        R_next.ref_point = tuple(R_next.tms[0].ref_point)
+
+        if self.shrink_wrap_mode:
+            domain_full = list(R_next.domain)
+            ref_full = tuple(R_next.ref_point)
+            time_tm_orig = R_next.tms[-1]
+            state_tms_orig = [tm.copy() for tm in R_next.tms[:state_dim]]
             try:
-                t_abs_current = float(R_prev.domain[-1].lower)
-            except Exception:
-                t_abs_current = 0.0
+                R_next_state = TMVector(R_next.tms[:state_dim])
+                ring = R_next_state.tms[0].poly.ring
+                dim = ring.ngens()
+                state_box = [Interval(-1.0, 1.0)] * state_dim
+                if len(ref_full) >= state_dim:
+                    state_ref = list(ref_full[:state_dim])
+                else:
+                    state_ref = [0.0] * state_dim
+                if dim == state_dim + 1 and self.time_var in ring.variable_names():
+                    state_box = state_box + [Interval(0.0, 0.0)]
+                    state_ref = state_ref + [0.0]
+                for tm in R_next_state.tms:
+                    tm.domain = list(state_box)
+                    tm.ref_point = tuple(state_ref)
 
-            t_abs_next = t_abs_current + float(h)
-
-            # enforce absolute time in R_next
-            for tm in R_next.tms:
-                dom = list(tm.domain)
-                rp = list(tm.ref_point)
-                if len(dom) < state_dim + 1:
-                    dom = dom + [Interval(0.0, 0.0)] * ((state_dim + 1) - len(dom))
-                if len(rp) < state_dim + 1:
-                    rp = rp + [0.0] * ((state_dim + 1) - len(rp))
-                dom[-1] = Interval(t_abs_next, t_abs_next)
-                rp[-1] = t_abs_next
-                tm.domain = dom
-                tm.ref_point = tuple(rp)
-
-            R_next.domain = copy.deepcopy(R_next.tms[0].domain)
-            R_next.ref_point = copy.deepcopy(R_next.tms[0].ref_point)
-
-            if self.shrink_wrap_mode:
-                domain_full = list(R_next.domain)
-                ref_full = tuple(R_next.ref_point)
-                time_tm_orig = R_next.tms[-1]
-                state_tms_orig = [tm.copy() for tm in R_next.tms[:state_dim]]
-                try:
-                    R_next_state = TMVector(R_next.tms[:state_dim])
-                    ring = R_next_state.tms[0].poly.ring
-                    dim = ring.ngens()
-                    state_box = [Interval(-1.0, 1.0)] * state_dim
-                    if len(ref_full) >= state_dim:
-                        state_ref = list(ref_full[:state_dim])
-                    else:
-                        state_ref = [0.0] * state_dim
-                    if dim == state_dim + 1 and self.time_var in ring.variable_names():
-                        state_box = state_box + [Interval(0.0, 0.0)]
-                        state_ref = state_ref + [0.0]
-                    for tm in R_next_state.tms:
-                        tm.domain = list(state_box)
-                        tm.ref_point = tuple(state_ref)
-
-                    sw_verbose = getattr(self, "verbose", False)
-                    sw2 = Precondition.shrink_wrap_corrected(
-                        R_next_state,
-                        time_var=self.time_var,
-                        slack_q=1e-12,
-                        max_iter=10,
-                        q_cap=1.2,
-                        use_preconditioning=True,
-                        verbose=sw_verbose
-                    )
-                    if sw2.get('success', False):
-                        candidate_state = sw2['T_sw']
-                        if sw_verbose and sw2.get('warn') == 'SANITY_FAIL':
-                            print("L/R shrink wrap (R_next) warning: SANITY_FAIL")
-                        for i in range(state_dim):
-                            R_next.tms[i] = candidate_state.tms[i]
-                            R_next.tms[i].domain = domain_full
-                            R_next.tms[i].ref_point = ref_full
-                        ok2, _, reason2, _ = Precondition.check_right_invariant(
-                            R_next, state_dim=state_dim, slack=1e-12, time_var=self.time_var, verbose=sw_verbose
-                        )
-                        if not ok2:
-                            # attempt re-normalization before reverting
-                            try:
-                                range_of_yr2 = candidate_state.bound()
-                                midpoints_m2 = [iv.midpoint() for iv in range_of_yr2]
-                                scale_factors_S2 = []
-                                inv_scale_factors_S2 = []
-                                MIN_RAD = 1e-14
-                                for iv in range_of_yr2:
-                                    rad = float(iv.radius())
-                                    if rad < MIN_RAD:
-                                        rad = MIN_RAD
-                                    scale_factors_S2.append(rad)
-                                    inv_scale_factors_S2.append(1.0 / rad)
-
-                                T_target2 = TMVector(list(candidate_state.tms) + [time_tm_orig])
-                                R_next2 = Precondition.normalize_right_model(
-                                    tm_target=T_target2,
-                                    midpoints_m=midpoints_m2,
-                                    inv_scale_factors_S=inv_scale_factors_S2
-                                )
-                                for tm in R_next2.tms:
-                                    tm.domain = domain_full
-                                    tm.ref_point = ref_full
-                                R_next2.domain = list(domain_full)
-                                R_next2.ref_point = ref_full
-
-                                ok3, _, _, _ = Precondition.check_right_invariant(
-                                    R_next2, state_dim=state_dim, slack=1e-12, time_var=self.time_var, verbose=sw_verbose
-                                )
-                                if ok3:
-                                    if sw_verbose:
-                                        q_list = sw2.get('q', [])
-                                        q_max = max([float(q) for q in q_list]) if q_list else None
-                                        print(f"L/R shrink wrap (R_next) kept after re-normalize; q_max={q_max}")
-                                    R_next = R_next2
-                                    ok2 = True
-                            except Exception:
-                                pass
-                            if not ok2:
-                                if sw_verbose:
-                                    q_list = sw2.get('q', [])
-                                    q_max = max([float(q) for q in q_list]) if q_list else None
-                                    print(f"L/R shrink wrap (R_next) reverted: invariant violated; q_max={q_max}")
-                                for i in range(state_dim):
-                                    R_next.tms[i] = state_tms_orig[i]
-                        else:
-                            if sw_verbose:
-                                q_list = sw2.get('q', [])
-                                q_max = max([float(q) for q in q_list]) if q_list else None
-                                print(f"L/R shrink wrap (R_next) kept: q_max={q_max}")
-                    else:
-                        if sw_verbose:
-                            q_list = sw2.get('q', [])
-                            q_max = max([float(q) for q in q_list]) if q_list else None
-                            print(f"L/R shrink wrap (R_next) skipped: reason={sw2.get('reason', 'UNKNOWN')}, q_max={q_max}")
-                except Exception:
-                    for i in range(state_dim):
-                        R_next.tms[i] = state_tms_orig[i]
-
-            A_l = Q @ np.diag(scale_factors_S)
-
-            slack = 1e-12
-            ok, bounds, reason, accept = Precondition.check_right_invariant(
-                R_next, state_dim=state_dim, slack=slack, time_var=self.time_var, verbose=getattr(self, "verbose", False)
-            )
-            if not ok:
-                violated = [(i, b) for i, b in enumerate(bounds) if not accept.encloses(b)]
-                step_label = step_idx if step_idx is not None else "?"
-                # FIXME before final merge to main
-                print(
-                    f"L/R invariant failed at step {step_label}, h={h}: "
-                    f"violations={violated}, target={accept}, reason={reason}, bounds_len={len(bounds)}"
+                sw2 = Precondition.shrink_wrap_corrected(
+                    R_next_state,
+                    time_var=self.time_var,
+                    slack_q=1e-12,
+                    max_iter=10,
+                    q_cap=1.2,
+                    use_preconditioning=True,
                 )
-                return {'success': False, 'reason': 'R_INVARIANT'}
+                if sw2.get('success', False):
+                    candidate_state = sw2['T_sw']
+                    for i in range(state_dim):
+                        R_next.tms[i] = candidate_state.tms[i]
+                        R_next.tms[i].domain = domain_full
+                        R_next.tms[i].ref_point = ref_full
+                    ok2, _, reason2, _ = Precondition.check_right_invariant(
+                        R_next, state_dim=state_dim, slack=1e-12, time_var=self.time_var, verbose=sw_verbose
+                    )
+                    if not ok2:
+                        # attempt re-normalization before reverting
+                        try:
+                            range_of_yr2 = candidate_state.bound()
+                            midpoints_m2 = [iv.midpoint() for iv in range_of_yr2]
+                            scale_factors_S2 = []
+                            inv_scale_factors_S2 = []
+                            MIN_RAD = 1e-14
+                            for iv in range_of_yr2:
+                                rad = float(iv.radius())
+                                if rad < MIN_RAD:
+                                    rad = MIN_RAD
+                                scale_factors_S2.append(rad)
+                                inv_scale_factors_S2.append(1.0 / rad)
+
+                            T_target2 = TMVector(list(candidate_state.tms) + [time_tm_orig])
+                            R_next2 = Precondition.normalize_right_model(
+                                tm_target=T_target2,
+                                midpoints_m=midpoints_m2,
+                                inv_scale_factors_S=inv_scale_factors_S2
+                            )
+                            for tm in R_next2.tms:
+                                tm.domain = domain_full
+                                tm.ref_point = ref_full
+                            R_next2.domain = list(domain_full)
+                            R_next2.ref_point = ref_full
+
+                            ok3, _, _, _ = Precondition.check_right_invariant(
+                                R_next2, state_dim=state_dim, slack=1e-12, time_var=self.time_var, verbose=sw_verbose
+                            )
+                            if ok3:
+                                R_next = R_next2
+                                ok2 = True
+                        except Exception:
+                            pass
+                        if not ok2:
+                            for i in range(state_dim):
+                                R_next.tms[i] = state_tms_orig[i]
+            except Exception:
+                for i in range(state_dim):
+                    R_next.tms[i] = state_tms_orig[i]
+
+        A_l = Q @ np.diag(scale_factors_S)
+
+        slack = 1e-12
+        ok, bounds, reason, accept = Precondition.check_right_invariant(
+            R_next, state_dim=state_dim, slack=slack, time_var=self.time_var, verbose=getattr(self, "verbose", False)
+        )
+        if not ok:
+            # violated = [(i, b) for i, b in enumerate(bounds) if not accept.encloses(b)]
+            # step_label = step_idx if step_idx is not None else "?"
+            # print(
+            #     f"L/R invariant failed at step {step_label}, h={h}: "
+            #     f"violations={violated}, target={accept}, reason={reason}, bounds_len={len(bounds)}"
+            # )
+            return {'success': False, 'reason': 'R_INVARIANT'}
         
         return {
             'success': True,
@@ -1418,8 +1364,8 @@ class TMReach:
             gens = ring.gens()
             
             # build local time tm w [0,h] domain and ref_point 0
-            tau_domain = copy.deepcopy(R_prev.domain)
-            tau_ref = list(copy.deepcopy(R_prev.ref_point))
+            tau_domain = list(R_prev.domain)
+            tau_ref = list(R_prev.ref_point)
 
             required_dim = proto_tm.poly.dim
             if len(tau_domain) < required_dim:
@@ -1440,9 +1386,9 @@ class TMReach:
             )
             replacements = []
             for i in range(state_dim):
-                tm_copy = copy.deepcopy(R_prev.tms[i])
+                tm_copy = R_prev.tms[i].copy()
                 # force domain/ref_point compatibility with tau
-                tm_copy.domain = copy.deepcopy(tau_domain)
+                tm_copy.domain = list(tau_domain)
                 tm_copy.ref_point = tuple(tau_ref)
                 replacements.append(tm_copy)     
 
@@ -1455,11 +1401,11 @@ class TMReach:
             self.logger.debug("Vis Composition failed at t=%s: %s", t_current, e)
             # fallback: Compose the affine next-step models (Snapshot at t=h)
             try:
-                fallback = L_next.compose([copy.deepcopy(tm) for tm in R_prev.tms])
+                fallback = L_next.compose([tm.copy() for tm in R_prev.tms])
                 return TMVector(fallback.tms[:state_dim])
             except Exception:
                 # last resort: return state part of R_prev (should not happen in a correct run)
-                return TMVector([copy.deepcopy(tm) for tm in R_prev.tms[:state_dim]])
+                return TMVector([tm.copy() for tm in R_prev.tms[:state_dim]])
         
     def _post_step_hook(self, step_info: dict, h: float):
         """ hook for subclasses to perform side-calculations like the stochastic extension

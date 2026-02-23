@@ -45,6 +45,10 @@ class TaylorModel:
         self.ref_point = ref_point
         self._bound_cache = None
         self._bound_cache_key = None
+        self._poly_bound_cache = None
+        self._poly_bound_cache_key = None
+        self._compose_deriv_cache = None
+        self._compose_deriv_cache_key = None
 
     def evaluate(self, point: Tuple) -> Interval:
         """Evaluate the Taylor model at a point."""
@@ -64,7 +68,13 @@ class TaylorModel:
         if self._bound_cache_key == cache_key and self._bound_cache is not None:
             return self._bound_cache
 
-        poly_bound = self.poly.range_evaluate(normalized_domain)
+        poly_key = (sage_poly_id, ring_id, domain_sig)
+        if self._poly_bound_cache_key == poly_key and self._poly_bound_cache is not None:
+            poly_bound = self._poly_bound_cache
+        else:
+            poly_bound = self.poly.range_evaluate(normalized_domain)
+            self._poly_bound_cache_key = poly_key
+            self._poly_bound_cache = poly_bound
         result = poly_bound + self.remainder
         self._bound_cache_key = cache_key
         self._bound_cache = result
@@ -238,6 +248,48 @@ class TaylorModel:
 
         return op1, op2
 
+    def _prepare_binary_op_view(self, other, tol: float = 1e-12):
+        """check compatibility of 2 tms (no copying!). truncate only if needed!!"""
+        if not isinstance(other, TaylorModel):
+            raise TypeError(f"Unsupported operand type for binary operation: {type(other)}")
+
+        # check dimension
+        if self.dimension != other.dimension:
+            raise ValueError(f"Dimension mismatch: TM1 has {self.dimension}, TM2 has {other.dimension}.")
+
+        # check reference points
+        if len(self.ref_point) != len(other.ref_point):
+            raise ValueError("Reference point dimensions do not match.")
+        for p1, p2 in zip(self.ref_point, other.ref_point):
+            if abs(p1 - p2) > tol:
+                raise ValueError(f"Reference point mismatch: {self.ref_point} vs {other.ref_point}.")
+
+        # check domains (within tolerance)
+        if len(self.domain) != len(other.domain):
+            raise ValueError("Domain dimensions do not match.")
+        for d1, d2 in zip(self.domain, other.domain):
+            if not (abs(d1.lower - d2.lower) < tol and abs(d1.upper - d2.upper) < tol):
+                raise ValueError(f"Domain mismatch: {self.domain} vs {other.domain}.")
+
+        # standardize order by truncating the higher-order TM
+        if self.max_order > other.max_order:
+            return self.truncate(other.max_order), other
+        if other.max_order > self.max_order:
+            return self, other.truncate(self.max_order)
+        return self, other
+
+    def poly_bound(self) -> Interval:
+        """Return cached polynomial bound (without remainder)"""
+        normalized_domain = tuple(self.domain)
+        domain_sig = tuple((iv.lower, iv.upper) for iv in normalized_domain)
+        poly_key = (id(self.poly.poly), id(self.poly.ring), domain_sig)
+        if self._poly_bound_cache_key == poly_key and self._poly_bound_cache is not None:
+            return self._poly_bound_cache
+        poly_bound = self.poly.range_evaluate(normalized_domain)
+        self._poly_bound_cache_key = poly_key
+        self._poly_bound_cache = poly_bound
+        return poly_bound
+
     # Arithmetic operator overloading
     def __neg__(self):
         """negation of a taylor model -(p,I) = (-p, -I)"""
@@ -254,7 +306,6 @@ class TaylorModel:
         )
 
     def __add__(self, other):
-
         if isinstance(other, (numbers.Number, int, float, Interval, Integer)):
             # scalar = create a constant TM from 'other'
             const_poly = Polynomial(_poly=self.poly.ring(Interval(other)._interval))
@@ -324,8 +375,53 @@ class TaylorModel:
     def __mul__(self, other):
         # CASE 1: TaylorModel * TaylorModel
         if hasattr(other, 'poly') and hasattr(other, 'remainder'):
-            op1, op2 = self._prepare_binary_op(other)
+            op1, op2 = self._prepare_binary_op_view(other)
             max_order = op1.max_order
+
+            # fast path: one polynomial is constant
+            c1 = op1.poly.constant_coeff_if_constant()
+            c2 = op2.poly.constant_coeff_if_constant()
+            if c1 is not None or c2 is not None:
+                if c1 is not None:
+                    const_coeff = c1
+                    tm_other = op2
+                    r_const = op1.remainder
+                    r_other = op2.remainder
+                else:
+                    const_coeff = c2
+                    tm_other = op1
+                    r_const = op2.remainder
+                    r_other = op1.remainder
+
+                const_iv = Interval(const_coeff)
+                scaled_poly = tm_other.poly * const_iv
+
+                # truncation remainder is zero when multiplying by constant
+                trunc_rem = Interval(0)
+
+                # remainder propagation
+                r_const_zero = (r_const.lower == 0 and r_const.upper == 0)
+
+                rem_p_other_r_const = Interval(0)
+                if not r_const_zero:
+                    try:
+                        bound_p_other = tm_other.bound() - r_other
+                    except Exception:
+                        bound_p_other = tm_other.poly.range_evaluate(tuple(self.domain))
+                    rem_p_other_r_const = bound_p_other * r_const
+
+                rem_r_other_const = r_other * const_iv
+                rem_r1_r2 = r_const * r_other
+
+                new_rem = trunc_rem + rem_p_other_r_const + rem_r_other_const + rem_r1_r2
+
+                return TaylorModel(
+                    poly=scaled_poly,
+                    rem=new_rem,
+                    domain=tm_other.domain,
+                    ref_point=tm_other.ref_point,
+                    max_order=max_order
+                )
 
             prod_poly_sage = op1.poly.poly * op2.poly.poly
 
@@ -334,29 +430,89 @@ class TaylorModel:
 
             normalized_domain = tuple(self.domain)  # (Interval(-1, 1),) * op1.dimension
             is_univariate = op1.dimension == 1
+            power_cache = [{} for _ in range(op1.dimension)]
 
-            for exponents, coeff in prod_poly_sage.dict().items():
+            fast_no_trunc = False
+            try:
+                prod_deg = prod_poly_sage.total_degree()
+                fast_no_trunc = (prod_deg is not None and prod_deg <= max_order)
+            except Exception:
+                fast_no_trunc = False
+
+            if fast_no_trunc:
+                new_poly = Polynomial(_poly=prod_poly_sage, _ring=op1.poly.ring)
+            else:
+                def _bound_monomial_cached(coeff, exp_tuple):
+                    term = Interval(coeff)
+                    for i, exp in enumerate(exp_tuple):
+                        if exp > 0:
+                            cache_i = power_cache[i]
+                            cached = cache_i.get(exp)
+                            if cached is None:
+                                cached = normalized_domain[i] ** exp
+                                cache_i[exp] = cached
+                            term *= cached
+                    return term
+
+                dprod = prod_poly_sage.dict()
                 if is_univariate:
-                    exp_tuple = (exponents,) if exponents != () else (0,)
+                    for k, coeff in dprod.items():
+                        e = 0 if k == () else k
+                        if e <= max_order:
+                            kept_coeffs[k] = coeff
+                        else:
+                            term = Interval(coeff)
+                            if e > 0:
+                                cached = power_cache[0].get(e)
+                                if cached is None:
+                                    cached = normalized_domain[0] ** e
+                                    power_cache[0][e] = cached
+                                term *= cached
+                            trunc_rem += term
                 else:
-                    exp_tuple = exponents if exponents else (0,) * op1.dimension
+                    for exps, coeff in dprod.items():
+                        deg = sum(exps)
+                        if deg <= max_order:
+                            kept_coeffs[exps] = coeff
+                        else:
+                            term = Interval(coeff)
+                            for i, e in enumerate(exps):
+                                if e:
+                                    cache_i = power_cache[i]
+                                    cached = cache_i.get(e)
+                                    if cached is None:
+                                        cached = normalized_domain[i] ** e
+                                        cache_i[e] = cached
+                                    term *= cached
+                            trunc_rem += term
 
-                if sum(exp_tuple) <= max_order:
-                    kept_coeffs[exponents] = coeff
-                else:
-                    trunc_rem += bound_monomial(coeff, exp_tuple, normalized_domain)
+                new_poly_sage = op1.poly.ring(kept_coeffs)
+                new_poly = Polynomial(_poly=new_poly_sage)
 
-            new_poly_sage = op1.poly.ring(kept_coeffs)
-            new_poly = Polynomial(_poly=new_poly_sage)
+            r1 = op1.remainder
+            r2 = op2.remainder
+            r1_zero = (r1.lower == 0 and r1.upper == 0)
+            r2_zero = (r2.lower == 0 and r2.upper == 0)
 
-            bound_p1 = op1.poly.range_evaluate(tuple(self.domain))
-            bound_p2 = op2.poly.range_evaluate(tuple(self.domain))
+            if r1_zero and r2_zero:
+                new_rem = trunc_rem
+            else:
+                bound_p1 = None
+                bound_p2 = None
+                if not r2_zero:
+                    bound_p1 = op1.poly_bound()
+                if not r1_zero:
+                    bound_p2 = op2.poly_bound()
 
-            rem_p1_r2 = bound_p1 * op2.remainder
-            rem_p2_r1 = bound_p2 * op1.remainder
-            rem_r1_r2 = op1.remainder * op2.remainder
+                rem_p1_r2 = Interval(0)
+                rem_p2_r1 = Interval(0)
+                rem_r1_r2 = r1 * r2
+                if not r2_zero:
+                    rem_p1_r2 = bound_p1 * r2
+                if not r1_zero:
+                    rem_p2_r1 = bound_p2 * r1
 
-            new_rem = trunc_rem + rem_p1_r2 + rem_p2_r1 + rem_r1_r2
+                new_rem = trunc_rem + rem_p1_r2 + rem_p2_r1 + rem_r1_r2
 
             result = TaylorModel(
                 poly=new_poly,
@@ -562,7 +718,67 @@ class TaylorModel:
         if len(replacements) != self.dimension:
             raise ValueError(f"Composition mismatch: Outer TM dim {self.dimension} vs {len(replacements)} replacements.")
 
-        # prepare symbolic substitution mpa
+        # fast path: affine (total degree <= 1)
+        try:
+            poly_dict = self.poly.poly.dict()
+            is_affine = True
+            linear_coeffs = {}
+            const_coeff = self.poly.ring(0)
+            if self.dimension == 1:
+                for exp, coeff in poly_dict.items():
+                    if exp == () or exp == 0 or (isinstance(exp, tuple) and len(exp) == 1 and exp[0] == 0):
+                        const_coeff += coeff
+                    elif (exp == 1) or (isinstance(exp, tuple) and len(exp) == 1 and exp[0] == 1):
+                        linear_coeffs[0] = linear_coeffs.get(0, self.poly.ring(0)) + coeff
+                    else:
+                        is_affine = False
+                        break
+            else:
+                for exp_tuple, coeff in poly_dict.items():
+                    if not exp_tuple:
+                        const_coeff += coeff
+                        continue
+                    if sum(exp_tuple) == 1:
+                        # find the index of the single 1
+                        try:
+                            idx = exp_tuple.index(1)
+                        except Exception:
+                            is_affine = False
+                            break
+                        linear_coeffs[idx] = linear_coeffs.get(idx, self.poly.ring(0)) + coeff
+                    else:
+                        is_affine = False
+                        break
+
+            if is_affine:
+                target_ring = replacements[0].poly.ring
+                new_poly_sage = target_ring(const_coeff)
+                for j, coeff in linear_coeffs.items():
+                    new_poly_sage += coeff * replacements[j].poly.poly
+
+                new_poly_wrapper = Polynomial(_poly=new_poly_sage, _ring=target_ring)
+
+                # remainder propagation: linear => exact gradient = coeff
+                inner_rems = [r.remainder for r in replacements]
+                propagated_rem = Interval(0)
+                for j, coeff in linear_coeffs.items():
+                    propagated_rem += Interval(coeff) * inner_rems[j]
+
+                total_rem = self.remainder + propagated_rem
+                result = TaylorModel(
+                    poly=new_poly_wrapper,
+                    rem=total_rem,
+                    domain=list(replacements[0].domain),
+                    ref_point=replacements[0].ref_point,
+                    max_order=self.max_order
+                )
+                result.sweep()
+                return result
+        except Exception:
+            # fallback to general path on any issue
+            pass
+
+        # prepare symbolic substitution map
         subs_map = {var: r.poly.poly for var, r in zip(self.poly.vars, replacements)}
 
         # perform fast symbolic composition
@@ -571,25 +787,25 @@ class TaylorModel:
         except Exception:
             # fallback for complex rings or mismatches
             return self._compose_horner_fallback(replacements)
-        
+
         # force it to stay in the right ring
         new_ring = replacements[0].poly.ring
         try:
             composed_poly_high = new_ring(composed_poly_raw)
         except Exception:
             return self._compose_horner_fallback(replacements)
-        
+
         target_ring = replacements[0].poly.ring
         target_dim = len(replacements[0].poly.vars)
         new_coeffs = {}
         truncation_rem = Interval(0)
-        
+
         target_domain = replacements[0].domain
         domain_intervals = tuple(target_domain)
         max_order = self.max_order
-        
+
         raw_dict = composed_poly_raw.dict()
-        
+
         # manually reconstruct the dictionary of coeffs
         for exponents, coeff in raw_dict.items():
             if isinstance(exponents, (int, numbers.Integral)):
@@ -601,14 +817,14 @@ class TaylorModel:
                             term_key = (0,) * target_dim
                         else:
                             return self._compose_horner_fallback(replacements)
-                except:
+                except Exception:
                     return self._compose_horner_fallback(replacements)
             else:
                 term_key = exponents
 
             # calculate order
             current_order = sum(term_key)
-            
+
             if current_order <= max_order:
                 # accumulate coefficients because multiple source terms might map to same dest term
                 if term_key in new_coeffs:
@@ -626,10 +842,10 @@ class TaylorModel:
         try:
             new_sage_poly = target_ring(new_coeffs)
         except Exception:
-             return self._compose_horner_fallback(replacements)
-             
+            return self._compose_horner_fallback(replacements)
+
         new_poly_wrapper = Polynomial(_poly=new_sage_poly, _ring=target_ring)
-        
+
         # propagate remainder
         # r_new = R_outer + Trunc_Error + (Grad(P) @ Range(f)) * R_inner
         inner_bounds = [r.bound() for r in replacements]
@@ -643,9 +859,18 @@ class TaylorModel:
                     f"compose(): replacement[{i}] remainder does not contain 0 "
                     f"(invalid TM decomposition for validated composition). remainder={Ri}"
                 )
-        
-        for i, var in enumerate(self.poly.vars):
-            derivative_poly = self.poly.poly.derivative(var)
+        deriv_cache_key = (id(self.poly.poly), id(self.poly.ring))
+        if self._compose_deriv_cache_key == deriv_cache_key and self._compose_deriv_cache is not None:
+            derivs = self._compose_deriv_cache
+        else:
+            derivs = []
+            for var in self.poly.vars:
+                derivative_poly = self.poly.poly.derivative(var)
+                derivs.append(derivative_poly)
+            self._compose_deriv_cache_key = deriv_cache_key
+            self._compose_deriv_cache = derivs
+
+        for i, derivative_poly in enumerate(derivs):
 
             if derivative_poly.is_zero():
                 continue
@@ -665,7 +890,7 @@ class TaylorModel:
             propagated_rem += grad_bound * inner_rems[i]
 
         total_rem = self.remainder + truncation_rem + propagated_rem
-        
+
         result = TaylorModel(
             poly=new_poly_wrapper,
             rem=total_rem,
@@ -673,7 +898,7 @@ class TaylorModel:
             ref_point=replacements[0].ref_point,
             max_order=max_order
         )
-        
+
         result.sweep()
         return result
     

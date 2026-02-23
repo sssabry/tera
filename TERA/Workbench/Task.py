@@ -127,7 +127,7 @@ class TaskRunner:
         if config.system_type == "continuous":
             result = TaskRunner._run_continuous(config, progress_bar)
         elif config.system_type == "hybrid":
-            result = TaskRunner._run_hybrid(config)
+            result = TaskRunner._run_hybrid(config, progress_bar)
         elif config.system_type == "stochastic":
             result = TaskRunner._run_stochastic(config, validate_results=validate_results, progress_bar=progress_bar)
         else:
@@ -192,7 +192,7 @@ class TaskRunner:
         return ReachResult(flowpipe, "continuous", config.vars, vars(config), status)
 
     @staticmethod
-    def _run_hybrid(config: TaskConfig) -> ReachResult:
+    def _run_hybrid(config: TaskConfig, progress_bar: bool) -> ReachResult:
         automaton = config.engine_params.get('automaton')
         
         state_var_names = [str(v) for v in config.vars]
@@ -224,6 +224,8 @@ class TaskRunner:
             'intersection_method': ep.get('intersection_method', 'combined'),
             'aggregation_method': ep.get('aggregation_method', 'PCA'),
             'aggregation_threshold': ep.get('aggregation_threshold', 10),
+            'aggregation_sample_mode': ep.get('aggregation_sample_mode', 'midpoint'),
+            'remainder_contraction': ep.get('remainder_contraction', False),
             'cutoff_threshold': ep.get('cutoff_threshold', 1e-12),
             'max_iterations': ep.get('max_iterations', 40),
             'step_grow_width_cap': ep.get('step_grow_width_cap', 1.0),
@@ -233,6 +235,7 @@ class TaskRunner:
             'id_stag_od_rel_tol': ep.get('id_stag_od_rel_tol', 1e-6),
             'id_stag_lambda': ep.get('id_stag_lambda', 1.0),
             'hybrid_id_full_linear_on_stagnation': ep.get('hybrid_id_full_linear_on_stagnation', False),
+            'progress_bar': progress_bar
         }
         
         engine = HybridReach(automaton, engine_cfg)

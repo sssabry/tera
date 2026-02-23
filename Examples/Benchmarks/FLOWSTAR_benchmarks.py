@@ -159,7 +159,8 @@ def get_chen_continuous():
         step_size=0.02,
         time_var='t_aug',
         remainder_estimation=[Interval(-1e-5, 1e-5)] * 2,
-        engine_params={'precondition_setup': 'ID', 'setting': 'single_step', 'fixed_step_mode': True}
+        engine_params={'precondition_setup': 'ID', 'setting': 'single_step', 'fixed_step_mode': True},
+        expected_final_width=0.0264 # from chen's thesis table 5.2
     )
 
     # Lotka-Volterra 
@@ -235,12 +236,13 @@ def get_chen_continuous():
         vars=[xl, yl, zl],
         f_expr=[10*(yl - xl), xl*(28 - zl) - yl, xl*yl - (8/3)*zl],
         initial_set=[Interval(14.999, 15.001), Interval(14.999, 15.001), Interval(35.999, 36.001)],
-        time_horizon=2.0,
-        order=12,
+        time_horizon=7.0,
+        order=7,
         step_size=0.02,
         time_var='t_lor',
         remainder_estimation=[Interval(-1e-5, 1e-5)] * 3,
-        engine_params={'fixed_step_mode': False, 'setting': 'single_step', 'precondition_setup': 'QR'}
+        engine_params={'fixed_step_mode': False, 'setting': 'single_step', 'precondition_setup': 'ID', "cutoff_threshold":1e-12},
+        expected_final_width=0.3751 # from chens thesis table 5.2
     )
 
     # Rössler Attractor

@@ -36,6 +36,7 @@ class HybridReach:
         self.config = config
         self.state_vars = config.get('state_vars')
         self.time_var = config.get('time_var', 't')
+        self.remainder_contraction = bool(config.get("remainder_contraction", False))
         # store flowpipes as List of (ModeName, FlowpipeSegment)
         self.reachable_set = []
         self._visited_workitems = {} # Dict[Tuple[str,int], List[Tuple[float, List[Interval]]]]
@@ -48,7 +49,12 @@ class HybridReach:
         total_horizon = self.config.get('time_horizon', 10.0)
         max_jumps = self.config.get('max_jumps', 5)
         urgent_jumps_mode = bool(self.config.get("urgent_jumps_mode", False))
+        progress_bar = bool(self.config.get('progress_bar', False))
+        t_progress = 0.0
 
+        if progress_bar:
+            from tqdm.auto import tqdm
+            pbar = tqdm(total=float(total_horizon), desc="Hybrid Reachability Analysis")
 
         # 1. init queue, where each task (mode, initTMV, globalTime, remainingJumps)
         for init_mode_name, initial_tmv in self.automaton.initial_sets:
@@ -58,15 +64,14 @@ class HybridReach:
                 self._mark_visited(prepared_tmv, mode_obj.name, 0.0, max_jumps)
                 queue.append((mode_obj, prepared_tmv, 0.0, max_jumps))
 
-
         # 2. main processing loop (algorithm 12 lines 6-24)
         while queue:
             curr_mode, initial_tmv, t_start, j_rem = queue.popleft()
-            
+        
             # check new mode's start time doesnt exceed global horizon
             if t_start >= total_horizon:
                 continue
-            
+        
             # a. compute continuous flow 
             # init ModeSolver for this mode
             solver = ModeSolver(
@@ -75,13 +80,28 @@ class HybridReach:
                 time_var=self.time_var,
                 config=self.config
             )
-            
+        
             # flow within mode until time allowance ends
             flowpipes, status = solver.propagate_mode_evolution(
                 initial_tmv, 
                 time_end=total_horizon, 
                 time_start=t_start
             )
+
+            # update progress bar with new max time if activated
+            if progress_bar:
+                if flowpipes:
+                    try: 
+                        t_end = float(flowpipes[-1]["time_interval_abs"].upper)
+                    except Exception:
+                        t_end = float(t_start)
+                    
+                else:
+                    t_end = float(t_start)
+                if t_end > t_progress:
+                    t_diff = t_end - t_progress
+                    t_progress = t_end
+                    pbar.update(float(t_diff))
 
             # if jump allowance available & transitions possible: analyze all flowpipes
             if j_rem > 0 and curr_mode.transitions and flowpipes:
@@ -107,6 +127,7 @@ class HybridReach:
                         order=self.config.get("order", 4),
                         method=self.config.get("aggregation_method", "PCA"),
                         candidates=None,  # keep fast; see optional section below
+                        sample_mode=self.config.get("aggregation_sample_mode", "midpoint"),
                     )
 
                     next_set = Intersection.apply_reset_map(agg_tmv, transition.reset, self.state_vars)
@@ -120,7 +141,10 @@ class HybridReach:
             for segment in flowpipes:
                 if segment.get('is_valid', True):
                     self.reachable_set.append({'mode': curr_mode.name, **segment})
-        
+
+        if progress_bar:
+            pbar.close()
+
         return self.reachable_set
     
     def _prepare_initial_tmv(self, tmv:TMVector, t_start: float) -> TMVector:
@@ -170,11 +194,6 @@ class HybridReach:
                 tm.sweep()
                 tms.append(tm)
             out = TMVector(tms)
-
-        # TODO: confirm whether this inflation is correct
-        epsilon = 1e-9
-        for tm in out.tms:
-            tm.remainder = tm.remainder + Interval(-epsilon, epsilon)
 
         return out  
 
@@ -257,7 +276,7 @@ class HybridReach:
                 candidate_indices = []
                 safe_indices = []
                 for tr_idx, tr in enumerate(transitions):
-                    q = Intersection.quick_guard_check_on_box(
+                    q = Intersection.quick_guard_check(
                         tr.guard, box, self.state_vars, time_iv, self.time_var
                     )
                     if q == "VIOLATED":
@@ -275,7 +294,8 @@ class HybridReach:
                 for tr_idx in candidate_indices:
                     tr = transitions[tr_idx]
                     f_g = Intersection.intersect_flowpipe_guard(
-                        tmv_seg, tr.guard, self.state_vars, method=intersection_method
+                        tmv_seg, tr.guard, self.state_vars, method=intersection_method,
+                        remainder_contraction=self.remainder_contraction,
                     )
                     if f_g is not None:
                         per_transition[tr_idx].append(f_g)
@@ -302,6 +322,7 @@ class HybridReach:
         transitions = list(curr_mode.transitions)
         n_tr = len(transitions)
         buckets = [[] for _ in range(n_tr)]
+        buckets_bounds = [[] for _ in range(n_tr)]
         t_r_map = [None for _ in range(n_tr)]  # earliest time low @ which there's an intersection
         for segment in flowpipes:
             if not segment.get("is_valid", True):
@@ -321,7 +342,7 @@ class HybridReach:
 
             for tr_idx, tr in enumerate(transitions):
                 # cheap pre-filter
-                q = Intersection.quick_guard_check_on_box(tr.guard, box, self.state_vars, time_iv, self.time_var)
+                q = Intersection.quick_guard_check(tr.guard, box, self.state_vars, time_iv, self.time_var)
 
                 if q == "VIOLATED":
                     continue
@@ -329,8 +350,9 @@ class HybridReach:
                 if q == "SAFE":
                     f_g = tmv_seg  # no intersection needed
                 else:
-                    f_g = Intersection.intersect_flowpipe_guard(
-                        tmv_seg, tr.guard, self.state_vars, method=intersection_method
+                    f_g= Intersection.intersect_flowpipe_guard(
+                        tmv_seg, tr.guard, self.state_vars, method=intersection_method,
+                        remainder_contraction=self.remainder_contraction,
                     )
                     if f_g is None:
                         continue
@@ -351,6 +373,8 @@ class HybridReach:
                         order=self.config.get("order", 4),
                         method=self.config.get("aggregation_method", "PCA"),
                         candidates=None,
+                        sample_mode=self.config.get("aggregation_sample_mode", "midpoint"),
+                        precomputed_bounds=buckets_bounds[tr_idx],
                     )
                     buckets[tr_idx] = [agg]  # replace bucket with aggregated single TMV
 

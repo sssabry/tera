@@ -202,7 +202,7 @@ def get_arch_continuous_2017() -> Dict[str, TaskConfig]:
         time_horizon=20.0,
         order=4,
         step_size=0.05,
-        remainder_estimation=[Interval(-1e-4, 1e-4)] * 7,
+        remainder_estimation=[Interval(-3e-4, 3e-4)] * 7,
         engine_params={"precondition_setup": "ID"},
         expected_final_width=0.01044,  # Flow* in x_4 dimension from ARCH 2018
         unsafe_sets=[{"dims": {3: Interval(4.5, float('inf'))}, "start_time": 0.0}],
@@ -248,13 +248,29 @@ def get_arch_continuous_2017() -> Dict[str, TaskConfig]:
         initial_set=[Interval(-0.4, 0.4)] * 6 + [Interval(0.0, 0.0)] * 6,
         time_horizon=5.0,
         order=4,
-        step_size=0.01,
+        step_size=0.02,
         time_var="ta",
-        remainder_estimation=list([Interval(-5e-2, 5e-2)] * 3 + [Interval(-1e-4, 1e-4)] * 8 + [Interval(-1e-12, 1e-12)]),
+        remainder_estimation = [
+            Interval(-1.05e-4, 1.05e-4),  # x1
+            Interval(-1.05e-4, 1.05e-4),  # x2
+            Interval(-1.02e-4, 1.02e-4),  # x3
+            Interval(-1.25e-4, 1.25e-4),  # x4
+            Interval(-1.25e-4, 1.25e-4),  # x5
+            Interval(-1.12e-4, 1.12e-4),  # x6
+            Interval(-1.02e-4, 1.02e-4),  # x7
+            Interval(-1.02e-4, 1.02e-4),  # x8
+
+            Interval(-8.0e-5, 8.0e-5),    # x9  (conservative default)
+            Interval(-5.0e-5, 5.0e-5),    # x10 (rates: smaller)
+            Interval(-5.0e-5, 5.0e-5),    # x11
+            Interval(-5.0e-5, 5.0e-5),    # x12
+        ],
         engine_params={
             "precondition_setup": "ID",
             "fixed_step_mode": False,
-            "max_step": 0.025
+            "max_step": 0.05,
+            "cutoff_threshold": 1e-8,
+            "step_grow_width_cap": 5e-2
         },
         expected_final_width=0.0003103,
         # missing reachability goal region - future fix

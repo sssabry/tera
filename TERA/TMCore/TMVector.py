@@ -52,6 +52,10 @@ class TMVector:
     def __repr__(self) -> str:
         return f"TMVector (dim={self.vector_dimension}) [\n,\n".join(f"  {tm}" for tm in self.tms) + "\n]"
 
+    def copy(self) -> 'TMVector':
+        """Create a safe full copy of the TMVector."""
+        return TMVector([tm.copy() for tm in self.tms])
+
     # unary operations
     def __neg__(self) -> 'TMVector':
         """Return element-wise negation."""
@@ -343,43 +347,6 @@ class TMVector:
             
         return cls(new_tms)
 
-    def restrict_and_normalize(self, sub_domain: List[Interval]) -> 'TMVector':
-        """
-        Restricts the TMVector to a sub-domain and re-normalizes that 
-        sub-domain back to [-1, 1]^n for the next mode's integration.
-        """
-        from sage.all import RIF
-        new_tms = []
-        
-        for i, tm in enumerate(self.tms):
-            substitutions = []
-            ring = tm.poly.ring
-            for j, iv in enumerate(sub_domain):
-                # Coerce midpoint and radius to RIF to match the ring's base field
-                mid = RIF(iv.midpoint())
-                rad = RIF(iv.radius())
-                
-                var_poly = ring.gen(j)
-                sub_poly = mid + rad * var_poly 
-                substitutions.append(sub_poly)
-            
-            # Perform Polynomial Composition
-            new_poly_sage = tm.poly.poly.subs({ring.gen(j): substitutions[j] 
-                                            for j in range(len(substitutions))})
-            
-            # The new domain is now back to [-1, 1]
-            norm_domain = [Interval(-1, 1)] * len(sub_domain)
-            
-            new_tms.append(TaylorModel(
-                poly=Polynomial(_poly=new_poly_sage, _ring=ring),
-                rem=tm.remainder,
-                domain=norm_domain,
-                ref_point=tm.ref_point,
-                max_order=tm.max_order
-            ))
-            
-        return TMVector(new_tms)
-
     def evaluate_symbolic(self, expr, state_vars: list, time_var_name: str = 't') -> TaylorModel:
         """
         Evaluates a symbolic expression (like a reset map or guard) 
@@ -439,7 +406,7 @@ class TMVector:
             result = eval(expr_str, {"__builtins__": None}, context)
             
             if not hasattr(result, 'poly'):
-                template = deepcopy(self.tms[0])
+                template = self.tms[0].copy()
                 template.domain = domain0
                 template.ref_point = ref0
                 return TaylorModel.from_constant(float(result), template)

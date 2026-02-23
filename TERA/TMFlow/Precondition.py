@@ -1,6 +1,5 @@
 """Preconditioning helpers for Taylor model flowpipes."""
 
-import copy
 from typing import List, Tuple, Optional
 from sage.all import RIF, PolynomialRing
 import numpy as np
@@ -11,7 +10,7 @@ from TERA.TMCore.Interval import Interval
 from TERA.TMCore.Polynomial import Polynomial
 
 # Right-model invariant check (L/R)
-def check_right_invariant(R: TMVector, state_dim: int, slack: float = 1e-12, time_var: Optional[str] = None, verbose: bool = False):
+def check_right_invariant(R: TMVector, state_dim: int, slack: float = 1e-12, time_var: Optional[str] = None):
     """
     Check that the right model maps the standard normalized box B=[-1,1]^n into itself
     required by the L/R compositional integration!!
@@ -29,11 +28,6 @@ def check_right_invariant(R: TMVector, state_dim: int, slack: float = 1e-12, tim
 
     valid_shape = (n_comp == state_dim and dim == state_dim) or (n_comp == state_dim + 1 and dim == state_dim + 1)
     if not valid_shape:
-        if verbose:
-            print(
-                f"L/R invariant check: invalid shape. "
-                f"n_comp={n_comp}, state_dim={state_dim}, ring_dim={dim}, vars={var_names}"
-            )
         return False, bounds, "SHAPE_MISMATCH", accept
 
     tgen = None
@@ -63,21 +57,11 @@ def check_right_invariant(R: TMVector, state_dim: int, slack: float = 1e-12, tim
         for i in range(state_dim):
             poly_obj = R.tms[i].poly.poly
             if _depends_on_var(poly_obj, tgen):
-                if verbose:
-                    print(
-                        f"L/R invariant check: right model depends on time var '{time_var}' "
-                        f"at component {i}. vars={var_names}"
-                    )
                 return False, bounds, "TIME_DEP", accept
 
     for i in range(state_dim):
         tm = R.tms[i]
         if len(tm.domain) != dim:
-            if verbose:
-                print(
-                    f"L/R invariant check: domain dim mismatch at component {i}. "
-                    f"domain={tm.domain}, expected_dim={dim}, vars={var_names}"
-                )
             return False, bounds, "DOMAIN_DIM", accept
         domain_eval = list(tm.domain)
         for j in range(state_dim):
@@ -162,8 +146,7 @@ def _bound_abs_gprime_over_qB(T_state: TMVector, q: List[RIF], R: Optional[np.nd
     return M_g
 
 def shrink_wrap_corrected(T_state: TMVector, time_var: Optional[str] = None, slack_q: float = 1e-12,
-    max_iter: int = 10, q_cap: float = 1.2, use_preconditioning: bool = True, verbose: bool = False, 
-    strict_sanity: bool = False) -> dict:
+    max_iter: int = 10, q_cap: float = 1.2, use_preconditioning: bool = True, strict_sanity: bool = False) -> dict:
     """Matching Florian Bunger's corrected shrink wrapping method (based on Berz/Makino classic theory)"""
 
     n = len(T_state.tms)
@@ -209,17 +192,6 @@ def shrink_wrap_corrected(T_state: TMVector, time_var: Optional[str] = None, sla
                 acc += M_g[i][j] * dq[j]
             s.append(acc)
         q_new = [RIF(1) + r[i] + s[i] for i in range(n)]
-
-        if verbose and n == 1:
-            q_box = [Interval(-q[0], q[0])]
-            M_p_int = _bound_jacobian_poly_over_box(T_state, q_box)
-            f_int = M_p_int[0][0]
-            if R is not None:
-                f_int = Interval(R[0, 0]) * f_int
-            g_int = f_int - Interval(1)
-            g_abs = max(abs(RIF(g_int.lower)), abs(RIF(g_int.upper)))
-            # optional debug info for 1D
-            print(f"[shrink_wrap] r={r[0]}, q={q[0]}, p'={f_int}, g'={g_int}, |g'|={g_abs}")
 
         if any(float(qi) > q_cap for qi in q_new):
             return {'success': False, 'reason': 'Q_TOO_LARGE', 'q': q_new}
@@ -303,7 +275,7 @@ def shift_to_origin(tmv_of_x0: TMVector):
     c_0 = []
 
     # create a centered version (x_deviation)
-    tmv_deviation = copy.deepcopy(tmv_of_x0)
+    tmv_deviation = tmv_of_x0.copy()
 
     for i in range(dimension):
         # extract constant part
@@ -336,7 +308,7 @@ def determine_magnitude(tmv_deviation: TMVector, domain: List[Interval]) -> List
 
 def apply_linear_map_to_tmv(tmv: TMVector, M: np.ndarray, state_dim: int) -> TMVector:
     """Apply a linear map to state components of a TMVector."""
-    out = copy.deepcopy(tmv)
+    out = tmv.copy()
     ring = out.tms[0].poly.ring
 
     new_tms = []
@@ -350,12 +322,12 @@ def apply_linear_map_to_tmv(tmv: TMVector, M: np.ndarray, state_dim: int) -> TMV
             acc_poly = acc_poly + RIF(a) * out.tms[j].poly.poly
             acc_rem = acc_rem + (Interval(a, a) * out.tms[j].remainder)
 
-        tm_i = copy.deepcopy(out.tms[i])
+        tm_i = out.tms[i].copy()
         tm_i.poly = Polynomial(_poly=acc_poly, _ring=ring)
         tm_i.remainder = acc_rem
         new_tms.append(tm_i)
 
-    trailing = [copy.deepcopy(tm) for tm in out.tms[state_dim:]]
+    trailing = [tm.copy() for tm in out.tms[state_dim:]]
     return TMVector(new_tms + trailing)
 
 def apply_diagonal_inv_scales_to_tmv(tmv: TMVector, inv_scales: List[float], state_dim: int) -> TMVector:
@@ -463,7 +435,7 @@ def compute_qr_matrix(A: np.ndarray) -> np.ndarray:
 def rotate_tmv(tmv_deviation: TMVector, Q: np.ndarray) -> TMVector:
     """Rotate a centered TMVector into the Q coordinate system."""
     state_dim = Q.shape[0]
-    tmv_rotated = copy.deepcopy(tmv_deviation)
+    tmv_rotated = tmv_deviation.copy()
 
     polys = [tm.poly for tm in tmv_deviation.tms]
     new_polys = []
@@ -661,7 +633,7 @@ def normalize_right_model(tm_target:TMVector, midpoints_m:List[float], inv_scale
         new_tms.append(new_tm)
 
     time_tm = tm_target.tms[-1]
-    new_tms.append(copy.deepcopy(time_tm))
+    new_tms.append(time_tm.copy())
 
     result = TMVector(new_tms)
     result.dimension = state_dim + 1

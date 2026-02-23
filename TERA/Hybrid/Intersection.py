@@ -43,6 +43,7 @@ def apply_reset_map(aggregated_tmv: TMVector, reset_map: ResetMap, state_vars: L
 
 def intersect_flowpipe_guard(tmv: TMVector, guard: Condition, state_vars: List[Any], 
                             time_var_name: str = 't', method: str = "combined", 
+                            remainder_contraction: bool = False,
                             **kwargs) -> Optional[TMVector]:
     """
     top-level directing funciton for flowpipe-guard intersection
@@ -61,8 +62,10 @@ def intersect_flowpipe_guard(tmv: TMVector, guard: Condition, state_vars: List[A
                                         epsilon=epsilon, order=order)
         
     elif method == "combined":
-        tight_tmv = domain_contraction(tmv, guard, state_vars, time_var_name, 
-                                       threshold=threshold, epsilon=epsilon)
+        tight_tmv = domain_contraction(
+            tmv, guard, state_vars, time_var_name, threshold=threshold, 
+            epsilon=epsilon, remainder_contraction=remainder_contraction
+        )
         
         if tight_tmv is None:
             return None #proven empty intersection early
@@ -74,7 +77,7 @@ def intersect_flowpipe_guard(tmv: TMVector, guard: Condition, state_vars: List[A
     
 def domain_contraction(tmv: TMVector, condition: Condition, state_vars: List[Any], 
                         time_var_name: str, threshold: float = 1e-4, 
-                        epsilon: float = 1e-6) -> Optional[TMVector]:
+                        epsilon: float = 1e-6, remainder_contraction: bool = False) -> Optional[TMVector]:
     """
     implements algorithm 14 from chen's thesis - efficient iterative domain refinement
     goal: find a conservative interval box D_c = X_0' * [t_h, t_l] such that all solutions satisfying
@@ -84,6 +87,7 @@ def domain_contraction(tmv: TMVector, condition: Condition, state_vars: List[Any
     curr_domain = [Interval(i.lower, i.upper) for i in tmv.domain]
     curr_remainder = [Interval(tm.remainder.lower, tm.remainder.upper) for tm in tmv.tms]
     prev_vol = _calc_box_volume(curr_domain, curr_remainder)
+    local_cache = {}
 
     # 2. iterate to refine: until reductoin is negligble
     # prevent infinite loops
@@ -93,20 +97,21 @@ def domain_contraction(tmv: TMVector, condition: Condition, state_vars: List[Any
         # a. refine domain vars (x0 and t)
         for j in range(len(curr_domain)):
             is_domain = True
-            lo = contract_variable_boundary(tmv, curr_domain, curr_remainder, condition, j, state_vars, time_var_name, epsilon, is_domain, True)
-            up = contract_variable_boundary(tmv, curr_domain, curr_remainder, condition, j, state_vars, time_var_name, epsilon, is_domain, False)
+            lo = contract_variable_boundary(tmv, curr_domain, curr_remainder, condition, j, state_vars, time_var_name, epsilon, is_domain, True, cache=local_cache)
+            up = contract_variable_boundary(tmv, curr_domain, curr_remainder, condition, j, state_vars, time_var_name, epsilon, is_domain, False, cache=local_cache)
             if lo > up: 
                 return None
             curr_domain[j] = Interval(lo, up)
             
         # b. refine remainder variables (y) - not t dimension
-        for k in range(len(curr_remainder) - 1):
-            is_domain = False
-            lo = contract_variable_boundary(tmv, curr_domain, curr_remainder, condition, k, state_vars, time_var_name, epsilon, is_domain, True)
-            up = contract_variable_boundary(tmv, curr_domain, curr_remainder, condition, k, state_vars, time_var_name, epsilon, is_domain, False)
-            if lo > up: 
-                return None # proven empty intersection
-            curr_remainder[k] = Interval(lo, up)
+        if remainder_contraction:
+            for k in range(len(curr_remainder) - 1):
+                is_domain = False
+                lo = contract_variable_boundary(tmv, curr_domain, curr_remainder, condition, k, state_vars, time_var_name, epsilon, is_domain, True, cache=local_cache)
+                up = contract_variable_boundary(tmv, curr_domain, curr_remainder, condition, k, state_vars, time_var_name, epsilon, is_domain, False, cache=local_cache)
+                if lo > up: 
+                    return None # proven empty intersection
+                curr_remainder[k] = Interval(lo, up)
         
         # 3. check convergence
         curr_vol = _calc_box_volume(curr_domain, curr_remainder)
@@ -128,13 +133,13 @@ def domain_contraction(tmv: TMVector, condition: Condition, state_vars: List[Any
 def contract_variable_boundary(tmv: TMVector, Dc: List[Interval], Rc: List[Interval], 
                              condition: Condition, var_idx: int, state_vars: List[Any],
                              time_var_name: str, epsilon: float, is_domain: bool,
-                             is_lower: bool) -> float:
+                             is_lower: bool, cache: Optional[dict] = None) -> float:
     """generalized boundary search combingin algorithm 15 and 16 from chen's thesis"""
     # init alpha/beta from existing domain or remainder
     box = Dc if is_domain else Rc
     alpha, beta = box[var_idx].lower, box[var_idx].upper
     local_eps = max(epsilon, (beta - alpha) * 1e-4)
-    local_cache = {}
+    local_cache = {} if cache is None else cache
 
     while (beta - alpha) >= local_eps:
         gamma = (alpha + beta) / 2.0
@@ -339,7 +344,9 @@ def _calc_box_volume(domain: List[Interval], remainder: List[Interval]) -> float
 
 def aggregate_intersections(intersection_list: List[TMVector], state_vars: List[Any], 
                             order: int, time_var_name: str, t_r: float, method: str = "PCA",
-                            candidates: Optional[List[np.ndarray]] = None) -> TMVector:
+                            candidates: Optional[List[np.ndarray]] = None,
+                            sample_mode: str = "midpoint",
+                            precomputed_bounds: Optional[List[List[Interval]]] = None) -> TMVector:
     """
     implements the general flowpipe aggregation framework from section 4.4. of chen's thesis
 
@@ -353,19 +360,34 @@ def aggregate_intersections(intersection_list: List[TMVector], state_vars: List[
     all_samples = []
     state_dim = len(state_vars)
 
-    for tmv in intersection_list:
+    for idx, tmv in enumerate(intersection_list):
         # a. midpoint sample
         mid_domain = [I.midpoint() for I in tmv.domain]
         mid_pt = tmv.evaluate(mid_domain) # Returns List[Interval]
         all_samples.append([I.midpoint() for I in mid_pt[:state_dim]])
-        
-        # b. boundary samples (simplified - min/max of each domain dim)
-        for i in range(len(tmv.domain)):
-            for val in [tmv.domain[i].lower, tmv.domain[i].upper]:
-                sample_domain = list(mid_domain)
-                sample_domain[i] = val
-                pt = tmv.evaluate(sample_domain)
-                all_samples.append([I.midpoint() for I in pt[:state_dim]])
+
+        # midpoint-only mode must add facet centers from a range enclosure
+        if sample_mode == "midpoint":
+            if precomputed_bounds is not None and idx < len(precomputed_bounds) and precomputed_bounds[idx] is not None:
+                box = precomputed_bounds[idx]
+            else:
+                box = tmv.bound()  # List[Interval], conservative enclosure in state space
+            c = [I.midpoint() for I in box[:state_dim]]
+            for i in range(state_dim):
+                p_lo = list(c); p_lo[i] = float(box[i].lower)
+                p_hi = list(c); p_hi[i] = float(box[i].upper)
+                all_samples.append(p_lo)
+                all_samples.append(p_hi)
+            continue
+
+        if sample_mode in {"facet", "full"}:
+            # b. boundary samples (simplified - min/max of each domain dim)
+            for i in range(len(tmv.domain)):
+                for val in [tmv.domain[i].lower, tmv.domain[i].upper]:
+                    sample_domain = list(mid_domain)
+                    sample_domain[i] = val
+                    pt = tmv.evaluate(sample_domain)
+                    all_samples.append([I.midpoint() for I in pt[:state_dim]])
 
     # convert to (n x m) matrix for linear algebra
     samples_matrix = np.array(all_samples).T 
@@ -538,3 +560,32 @@ def construct_parallelotope_tm(center: np.ndarray, Mg: np.ndarray, state_vars: L
     transformed_tms.append(time_tm)
     
     return TMVector(transformed_tms)
+
+
+def quick_guard_check(guard: Condition, box: List[Interval], state_vars: List[Any],
+                      time_interval: Interval, time_var_name: str = 't') -> str:
+    """cheap pre-filter for g(x) <= 0 over an interval enclosure
+    returns:
+        "SAFE" if all constraints are satisfied over the whole box
+        "VIOLATED" if any constraint is strictly violated over the whole box
+        "UNKNOWN" otherwise (boundary overlap)
+    """
+    if guard is None or not getattr(guard, "constraints", None):
+        return "SAFE"
+    
+    all_inside = True
+    for expr in guard.constraints:
+        val = _eval_constraint_on_box(expr, box, state_vars, time_interval, time_var_name)
+
+        # strictly violated everywhere: g(x) > 0 on entire box
+        if val.lower > 0:
+            return "VIOLATED"
+        
+        # strictly satisfied everywhere: g(x) <= 0 on entire box
+        if val.upper <= 0:
+            continue
+
+        # overlaps boundary: lo <= 0 < hi
+        all_inside = False
+
+    return "SAFE" if all_inside else "UNKNOWN"
