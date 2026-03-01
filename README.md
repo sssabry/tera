@@ -1,3 +1,4 @@
+![Continuous Single Step Jet Engine](Docs/Saved%20Plots/TERA_logo.png)
 # TERA
 
 **T**aylor Model **E**nabled **R**eachability **A**nalysis Framework.
@@ -10,7 +11,7 @@
 
 - **Validated TM flowpipe computation for nonlinear ODEs**
   - Local **single-step** TM integration (validated ODE solving in the sense of Berz/Makino-style TM integrators).
-  ![Continuous Single Step Jet Engine](Docs/Saved%20Plots/Continuous_SingleStep_JetEngine_xy.png)
+  ![Continuous Single Step Jet Engine](Docs/Saved%20Plots/Continuous_Lorenz_xy.png)
   - **Left–right (compositional) propagation** to mitigate wrapping over long horizons (“shrink-wrapping” preconditioning, formalized in later preconditioning work).
   ![Continuous Left-Right Quadratic Model](Docs/Saved%20Plots/Continuous_LeftRight_QuadraticModel_y1y2.png)
 - **Hybrid reachability**
