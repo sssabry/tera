@@ -29,12 +29,12 @@ def get_juliareach_benchmarks() -> Dict[str, TaskConfig]:
             Interval(-0.1, 0.1),
         ],
         time_horizon=20 * T,
-        order=21,
-        step_size=0.02,
+        order=5,
+        step_size=0.005,
         engine_params={
             "fixed_step_mode": False,
             "precondition_setup": "ID",
-            "plot_dims": (0, 1),
+            'min_step': 1e-12
         },
     )
 

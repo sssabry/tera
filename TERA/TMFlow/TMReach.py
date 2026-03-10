@@ -24,7 +24,7 @@ class TMReach:
             step_grow_width_cap: Optional[float] = None, id_preserve_coupling_on_stagnation: bool = False,
             id_stag_c_tol: float = 1e-12, id_stag_s_tol: float = 1e-10, id_stag_od_rel_tol: float = 1e-6,
             id_stag_lambda: float = 1.0, hybrid_id_full_linear_on_stagnation: bool = False,
-            shrink_wrap_mode: bool = False, verbose: bool = False):
+            shrink_wrap_mode: bool = False):
         """Initialize the reachability engine."""
         self.ode_exprs = ode_exprs
         self.state_vars = state_vars
@@ -36,7 +36,6 @@ class TMReach:
 
         self.preconditioning = precondition_setup
         self.shrink_wrap_mode = bool(shrink_wrap_mode)
-        self.verbose = bool(verbose)
 
         self.adaptive_order = adaptive_order
         self.min_order = min_order
@@ -87,17 +86,37 @@ class TMReach:
 
         20/11 modification - testing lambda based mapping to TaylorModel class's intrinsic funcs
         """
-        def _sin(x): return x.sin() if hasattr(x, 'sin') else sin(x)
-        def _cos(x): return x.cos() if hasattr(x, 'cos') else cos(x)
-        def _exp(x): return x.exp() if hasattr(x, 'exp') else exp(x)
+        def _tm_unary(name, math_fn):
+            """return a function that applies TM intrinsic if available, else math_fn"""
+            def _f(x):
+                m = getattr(x, name, None)
+                if callable(m):
+                    return m()
+                return math_fn(x)
+            return _f
 
-        context = {'sin': _sin, 'cos': _cos, 'exp': _exp, 'log': log}
+        _TM_EVAL_FUNCS = {'sin':  _tm_unary('sin',  math.sin), 'cos':  _tm_unary('cos',  math.cos),
+            'tan':  _tm_unary('tan',  math.tan), 'exp':  _tm_unary('exp',  math.exp),
+            'log':  _tm_unary('log',  math.log), 'sqrt': _tm_unary('sqrt', math.sqrt),
+            'pi': math.pi, 'e': math.e
+        }
+
+        context = {}
+        context.update(_TM_EVAL_FUNCS)
 
         var_names = [str(v) for v in vars]
         time_var = self.time_var
         lambda_args = ", ".join(var_names + [time_var])
 
-        uses_time = any(time_var in str(expr) for expr in ode_exprs)
+        uses_time = False
+        for expr in ode_exprs:
+            try:
+                if bool(expr.has(time_sym)):
+                    uses_time = True
+                    break
+            except Exception:
+                # non-Sage literals (int/float) -> cannot depend on time
+                continue
         if not uses_time:
             time_sym = SR.var(time_var)
             uses_time = any(bool(expr.has(time_sym)) for expr in ode_exprs)
@@ -219,13 +238,23 @@ class TMReach:
         except Exception as e:
             raise RuntimeError(f"SageMath Jacobian computation failed: {e}")
 
+        def _tm_unary(name, math_fn):
+            """return a function that applies TM intrinsic if available, else math_fn"""
+            def _f(x):
+                m = getattr(x, name, None)
+                if callable(m):
+                    return m()
+                return math_fn(x)
+            return _f
         # 2. Compile each cell of the matrix
-        def _sin(x): return x.sin() if hasattr(x, 'sin') else sin(x)
-        def _cos(x): return x.cos() if hasattr(x, 'cos') else cos(x)
-        def _exp(x): return x.exp() if hasattr(x, 'exp') else exp(x)
-        def _log(x): return x.log() if hasattr(x, 'log') else log(x)
-        
-        context = {'sin': _sin, 'cos': _cos, 'exp': _exp, 'log': _log}
+        _TM_EVAL_FUNCS = {'sin':  _tm_unary('sin',  math.sin), 'cos':  _tm_unary('cos',  math.cos),
+            'tan':  _tm_unary('tan',  math.tan), 'exp':  _tm_unary('exp',  math.exp),
+            'log':  _tm_unary('log',  math.log), 'sqrt': _tm_unary('sqrt', math.sqrt),
+            'pi': math.pi, 'e': math.e
+        }
+
+        context = {}
+        context.update(_TM_EVAL_FUNCS)
         var_names = [str(v) for v in vars]
         lambda_args = ", ".join(var_names)
 
@@ -260,18 +289,10 @@ class TMReach:
                     try:
                         val = compiled_matrix[r][c](*box)
                     except ZeroDivisionError as exc:
-                        print(f"[DBG][jacobian][ZeroDivisionError] cell=({r},{c}) expr={J_sym[r][c]}")
-                        for bi, iv in enumerate(box):
-                            try:
-                                contains_zero = bool(iv._interval.contains_zero())
-                            except Exception:
-                                contains_zero = "unknown"
-                            print(f"[DBG][jacobian][box] i={bi} iv={iv} contains_zero={contains_zero}")
                         # IMPORTANT: do not crash the run; signal failure to caller
                         return None
                     except Exception as exc:
                         # Treat any unexpected eval error as failure too (safe)
-                        print(f"[DBG][jacobian][EvalError] cell=({r},{c}) expr={J_sym[r][c]} exc={exc}")
                         return None
 
                     if not isinstance(val, Interval):
@@ -1144,7 +1165,6 @@ class TMReach:
             Q_poly = Precondition.rotate_tmv(M_centered, Q)
 
         except Exception as e:
-            print(f"DEBUG: Decomposition crashed: {e}")
             return {'success': False}
 
         # 3. perform shrink wrapping step w/ composition
@@ -1160,27 +1180,19 @@ class TMReach:
 
             T_state = Q_poly_state.compose(replacements)
             if self.shrink_wrap_mode:
-                sw_verbose = getattr(self, "verbose", False)
                 sw = Precondition.shrink_wrap_corrected(
                     T_state,
                     time_var=self.time_var,
                     slack_q=1e-12,
                     max_iter=10,
                     q_cap=1.2,
-                    use_preconditioning=True,
-                    verbose=sw_verbose
+                    use_preconditioning=True
                 )
                 if sw.get('success', False):
                     T_state = sw['T_sw']
-                    if sw_verbose and sw.get('warn') == 'SANITY_FAIL':
-                        print("L/R shrink wrap warning: SANITY_FAIL")
-                else:
-                    if sw_verbose:
-                        print(f"L/R shrink wrap skipped: {sw.get('reason', 'UNKNOWN')}")
             T_target = TMVector(list(T_state.tms) + [R_prev.tms[-1].copy()])
 
         except Exception as e:
-            print(f"DEBUG: Composition crashed: {e}")
             return {'success': False}
 
         # 4. scale to normalized domain
@@ -1279,7 +1291,7 @@ class TMReach:
                         R_next.tms[i].domain = domain_full
                         R_next.tms[i].ref_point = ref_full
                     ok2, _, reason2, _ = Precondition.check_right_invariant(
-                        R_next, state_dim=state_dim, slack=1e-12, time_var=self.time_var, verbose=sw_verbose
+                        R_next, state_dim=state_dim, slack=1e-12, time_var=self.time_var
                     )
                     if not ok2:
                         # attempt re-normalization before reverting
@@ -1309,7 +1321,7 @@ class TMReach:
                             R_next2.ref_point = ref_full
 
                             ok3, _, _, _ = Precondition.check_right_invariant(
-                                R_next2, state_dim=state_dim, slack=1e-12, time_var=self.time_var, verbose=sw_verbose
+                                R_next2, state_dim=state_dim, slack=1e-12, time_var=self.time_var
                             )
                             if ok3:
                                 R_next = R_next2
@@ -1327,7 +1339,7 @@ class TMReach:
 
         slack = 1e-12
         ok, bounds, reason, accept = Precondition.check_right_invariant(
-            R_next, state_dim=state_dim, slack=slack, time_var=self.time_var, verbose=getattr(self, "verbose", False)
+            R_next, state_dim=state_dim, slack=slack, time_var=self.time_var
         )
         if not ok:
             # violated = [(i, b) for i, b in enumerate(bounds) if not accept.encloses(b)]

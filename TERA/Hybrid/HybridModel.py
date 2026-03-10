@@ -5,13 +5,12 @@ from TERA.TMCore.TMVector import TMVector
 
 @dataclass
 class Condition:
-    """Represent guard or invariant constraints g(x) <= 0."""
-    # List of symbolic expressions (e.g., [x - 5, y + x]) representing g_i(x) <= 0
-    constraints: List[Any] 
-
-    def evaluate(tmVector):
-        """takes an interval or TM representing g(x)
-        used to detect if a flowpipe intersects a guard g(x) <= 0"""
+    """Represent guard/invariant constraints g_i(x) <= 0 (or strict < 0 when strict=True)."""
+    # List of symbolic expressions (e.g., [x - 5, y + x]) representing g_i(x) <= 0.
+    constraints: List[Any]
+    # strict=False means g_i(x) <= 0; strict=True means g_i(x) < 0.
+    # For >= or >, negate the expression and still use <= / < respectively.
+    strict: bool = False
 
 @dataclass
 class ResetMap:

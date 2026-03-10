@@ -58,6 +58,15 @@ class TaylorModel:
 
     def bound(self) -> Interval:
         """Return a cached bound of the Taylor model over its domain."""
+        if not hasattr(self, "_bound_cache"):
+            self._bound_cache = None
+        if not hasattr(self, "_bound_cache_key"):
+            self._bound_cache_key = None
+        if not hasattr(self, "_poly_bound_cache"):
+            self._poly_bound_cache = None
+        if not hasattr(self, "_poly_bound_cache_key"):
+            self._poly_bound_cache_key = None
+
         normalized_domain = tuple(self.domain)  # (Interval(-1, 1),) * self.dimension
         domain_sig = tuple((iv.lower, iv.upper) for iv in normalized_domain)
         rem_sig = (self.remainder.lower, self.remainder.upper)
@@ -280,6 +289,11 @@ class TaylorModel:
 
     def poly_bound(self) -> Interval:
         """Return cached polynomial bound (without remainder)"""
+        if not hasattr(self, "_poly_bound_cache"):
+            self._poly_bound_cache = None
+        if not hasattr(self, "_poly_bound_cache_key"):
+            self._poly_bound_cache_key = None
+
         normalized_domain = tuple(self.domain)
         domain_sig = tuple((iv.lower, iv.upper) for iv in normalized_domain)
         poly_key = (id(self.poly.poly), id(self.poly.ring), domain_sig)
@@ -1129,4 +1143,170 @@ class TaylorModel:
 
         result.remainder += rem_mag * Interval(-1.0, 1.0)
 
+        return result
+
+    def tan(self):
+        s = self.sin()
+        c = self.cos()
+        # require cos(T) does not enclose 0
+        if c.bound().contains(0):
+            raise ValueError("Tan undefined: cos(TM) encloses 0 on domain.")
+        return s / c
+    
+    def sqrt(self) -> 'TaylorModel':
+        """
+        sqrt(TM) following makino-berz definition
+        sqrt(f) = sqrt(cf) * (sum_{i=0}^k binom(1/2,i) (fbar/cf)^i) + (pure interval remainder),
+        given assumption that TM enclosure is strictly positive on the domain
+        """
+        order = self.max_order
+
+        # TM must be strictly positive on domain
+        full_bd = self.bound()
+        if full_bd.lower <= 0.0:
+            raise ValueError(f"sqrt(TM) undefined: enclosure not strictly positive: {full_bd}")
+
+        # decompose f = c0 + fbar using midpoint of constant part
+        c_int = self.get_constant_part()
+        c0 = float(c_int.midpoint())
+        if c0 <= 0.0:
+            # choose a safer positive center from full bound in case non-positive midpoint
+            c0 = float(full_bd.midpoint())
+            if c0 <= 0.0:
+                raise ValueError(f"sqrt(TM) failed to choose positive center; full bound: {full_bd}")
+
+        c0_tm = TaylorModel.from_constant(c0, self)
+        f_bar = self - c0_tm
+
+        # normalized variable x = f_bar / c0
+        inv_c0 = 1.0 / c0
+        x_tm = f_bar * inv_c0
+
+        # truncated binomial series S(x) = sum_{i=0}^order binom(1/2,i) x^i
+        # coefficient recurrence: a0=1, a_{i} = a_{i-1} * ((1/2)-(i-1)) / i
+        series = TaylorModel.from_constant(1.0, self)
+        x_pow = TaylorModel.from_constant(1.0, self)
+
+        a = 1.0  # a0
+        for i in range(1, order + 1):
+            x_pow = x_pow * x_tm
+            a = a * (0.5 - (i - 1)) / i
+            series = series + (x_pow * a)
+
+        # multiply by sqrt(c) + push uncertainty to remainder
+        sqrt_c_iv = c_int.sqrt()
+        sqrt_c0 = float(sqrt_c_iv.midpoint())
+
+        result = series * sqrt_c0
+
+        # carry sqrt(c) interval width into remainder via scaling of series bound
+        # (sqrt_c_iv - sqrt_c0) * series(D)
+        series_bd = series.bound()
+        sqrt_c_err = Interval(sqrt_c_iv.lower - sqrt_c0, sqrt_c_iv.upper - sqrt_c0)
+        result.remainder += sqrt_c_err * series_bd
+
+        # lagrange remainder (pure interval) per makino-berz paper
+        # R_{k+1} = +/- sqrt(cf) * (2k-1)!! / ((k+1)! 2^{k+1}) * x^{k+1} / (1 + θ x)^{k+1/2}, θ in (0,1)
+        # bound it using θ in [0,1], x in B(x_tm).
+        def double_factorial(n: int) -> int:
+            if n <= 0:
+                return 1
+            r = 1
+            for t in range(n, 0, -2):
+                r *= t
+            return r
+
+        k = order
+        x_bd = x_tm.bound()
+        abs_x_bd = x_bd.abs()
+
+        # bound |x|^{k+1}
+        x_pow_mag = abs_x_bd ** (k + 1)
+
+        # bound denom = 1 + θ x with θ in [0,1] => denom in 1 + x*[0,1]
+        denom_bd = Interval(1.0, 1.0) + (x_bd * Interval(0.0, 1.0))
+        if denom_bd.lower <= 0.0:
+            # means x could be <= -1 = singular lagrange bround
+            raise ValueError(f"sqrt(TM) remainder singular: 1 + θ*x encloses non-positive values: {denom_bd}")
+
+        # bound denom^{-(k+1/2)} using denom^{2k+1} then sqrt then reciprocal
+        denom_pow = denom_bd ** (2 * k + 1)   # integer power
+        denom_sqrt = denom_pow.sqrt()
+        denom_factor = Interval(1.0, 1.0) / denom_sqrt
+
+        # scalar coefficient: (2k-1)!! / ((k+1)! 2^{k+1})
+        coef = double_factorial(2 * k - 1) / (math.factorial(k + 1) * (2.0 ** (k + 1)))
+
+        # include sqrt(cf) as interval
+        rem_mag = (sqrt_c_iv * coef) * x_pow_mag * denom_factor
+
+        # add symmetric remainder
+        result.remainder += rem_mag * Interval(-1.0, 1.0)
+
+        # final cleanup
+        result.sweep()
+        return result
+    
+    def log(self) -> 'TaylorModel':
+        """
+        log(TM) as defined by Makino-Berz
+        log(f) = log(c0) + sum_{i=1}^k (-1)^{i+1} x^i / i  +  (pure interval remainder),
+        where f = c0*(1+x), x = (f - c0)/c0.
+        requires strict positivity in tm domain of f() and non-enclosure of 0 in the denominator
+        """
+        import math
+
+        k = self.max_order
+
+        # TM must be strictly positive on domain
+        f_bd = self.bound()
+        if f_bd.lower <= 0.0:
+            raise ValueError(f"log(TM) undefined: enclosure not strictly positive: {f_bd}")
+
+        # decompose f = c0 + fbar using midpoint of constant part
+        c0 = float(f_bd.midpoint())
+        if c0 <= 0.0:
+            # should not happen if f_bd.lower > 0 but js in case
+            c0 = float((f_bd.lower + f_bd.upper) * 0.5)
+            if c0 <= 0.0:
+                raise ValueError(f"log(TM) failed to choose positive center; bound: {f_bd}")
+
+        c0_tm = TaylorModel.from_constant(c0, self)
+
+        # normalize: f = c0 * (1 + x), where x = (f - c0)/c0
+        x_tm = (self - c0_tm) * (1.0 / c0)
+
+        # polynomial part: log(c0) + log(1+x) truncated at order k
+        result = TaylorModel.from_constant(math.log(c0), self)
+
+        x_pow = TaylorModel.from_constant(1.0, self)
+        for i in range(1, k + 1):
+            x_pow = x_pow * x_tm
+            coef = (1.0 / i) if (i % 2 == 1) else (-1.0 / i)  # (-1)^{i+1}/i
+            result = result + (x_pow * coef)
+
+        # lagrange remainder bound
+        # R_{k+1}(x) = f^{(k+1)}(θx) * x^{k+1} / (k+1)!  with f(z)=log(1+z)
+        # f^{(k+1)}(z) = (-1)^k * k! / (1+z)^{k+1}
+        # => R_{k+1}(x) = (-1)^k/(k+1) * x^{k+1} / (1+θx)^{k+1}, θ in (0,1)
+        # then bound with θ in [0,1], x in B(x_tm):
+        x_bd = x_tm.bound()
+        abs_x = x_bd.abs()
+        x_pow_mag = abs_x ** (k + 1)
+
+        # denom = 1 + θ x, θ in [0,1] => denom in 1 + x*[0,1]
+        denom_bd = Interval(1.0, 1.0) + (x_bd * Interval(0.0, 1.0))
+        if denom_bd.lower <= 0.0:
+            # remainder becomes singular
+            raise ValueError(f"log(TM) remainder singular: 1 + θ*x encloses non-positive values: {denom_bd}")
+
+        denom_pow = denom_bd ** (k + 1)
+        denom_factor = Interval(1.0, 1.0) / denom_pow
+
+        rem_mag = (x_pow_mag * denom_factor) * (1.0 / (k + 1))
+
+        # add symmetric remainder
+        result.remainder += rem_mag * Interval(-1.0, 1.0)
+
+        result.sweep()
         return result
