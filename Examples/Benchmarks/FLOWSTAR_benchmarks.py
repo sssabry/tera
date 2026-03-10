@@ -16,22 +16,22 @@ def build_bouncing_ball_automaton():
     g = 9.81
 
     # Mode: Down
-    down_inv = Condition(constraints=[-x, v])  # x >= 0, v <= 0
+    down_inv = Condition(constraints=[-x])  # x >= 0
     down_mode = Mode("down", [v, -g + 0.1 * v**2], down_inv)
 
     # Mode: Up
-    up_inv = Condition(constraints=[-x, -v])  # x >= 0, v >= 0
+    up_inv = Condition(constraints=[-x])  # x >= 0
     up_mode = Mode("up", [v, -g - 0.1 * v**2], up_inv)
 
     # Transition: Bounce (Down -> Up)
-    bounce_guard = Condition(constraints=[x])
-    bounce_reset = ResetMap(mapping={"v": -0.8 * v})
+    bounce_guard = Condition(constraints=[x, -x])
+    bounce_reset = ResetMap(mapping={"v": -0.8 * v, "x": 0})
     down_mode.transitions.append(
         Transition(down_mode, up_mode, bounce_guard, bounce_reset, "alpha")
     )
 
     # Transition: Apex (Up -> Down)
-    apex_guard = Condition(constraints=[v])
+    apex_guard = Condition(constraints=[v, -v])
     up_mode.transitions.append(
         Transition(up_mode, down_mode, apex_guard, ResetMap({}), "beta")
     )

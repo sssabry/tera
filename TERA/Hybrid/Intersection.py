@@ -74,6 +74,34 @@ def intersect_flowpipe_guard(tmv: TMVector, guard: Condition, state_vars: List[A
                                         epsilon=epsilon, order=order)
     else:
         raise ValueError(f"Unknown intersection method: {method}")
+
+def _classify_condition_on_box(condition: Condition, box: List[Interval], state_vars: List[Any],
+                               time_iv: Interval = None, time_var_name: str = "t") -> Tuple[str, List[Interval]]:
+    """classify condition g_i(x) <= 0 (or < 0 if strict=True) over an interval box"""
+    if condition is None or not getattr(condition, "constraints", None):
+        return "FULL", []
+
+    tiv = time_iv if time_iv is not None else Interval(0, 0)
+    cond_strict = bool(getattr(condition, "strict", False))
+    vals: List[Interval] = []
+    all_full = True
+
+    for expr in condition.constraints:
+        v = _eval_constraint_on_box(expr, box, state_vars, tiv, time_var_name)
+        vals.append(v)
+
+        if cond_strict:
+            if v.lower >= 0:
+                return "EMPTY", vals
+            if v.upper >= 0:
+                all_full = False
+        else:
+            if v.lower > 0:
+                return "EMPTY", vals
+            if v.upper > 0:
+                all_full = False
+
+    return ("FULL" if all_full else "UNKNOWN"), vals
     
 def domain_contraction(tmv: TMVector, condition: Condition, state_vars: List[Any], 
                         time_var_name: str, threshold: float = 1e-4, 
@@ -261,17 +289,21 @@ def _possibly_contains_solution(tmv: TMVector, domain: List[Interval],
         range_box = tmv.bound()
         time_interval = domain[-1]
 
-        # iterate through inequalities g_i(x) <= 0
+        # iterate through inequalities g_i(x) <= 0 (or strict < 0)
+        cond_strict = bool(getattr(condition, "strict", False))
         for expr in condition.constraints:
             # if lower bound of g(x) is strictly positive: rangebox cant satisfy <= 0
             val_interval = _eval_constraint_on_box(expr, range_box, state_vars, time_interval, time_var_name)
-            
-            # if minimum value > 0: g(x) <= 0 is impossible
-            if val_interval.lower > 0:
-                # strictly outside guard/invariant
+
+            if cond_strict:
+                if val_interval.lower >= 0:
+                    if cache is not None:
+                        cache[cache_key] = False
+                    return False
+            elif val_interval.lower > 0:
                 if cache is not None:
                     cache[cache_key] = False
-                return False 
+                return False
         # overlap or fully enclosed
         if cache is not None:
             cache[cache_key] = True
@@ -572,17 +604,24 @@ def quick_guard_check(guard: Condition, box: List[Interval], state_vars: List[An
     """
     if guard is None or not getattr(guard, "constraints", None):
         return "SAFE"
-    
+
+    guard_strict = bool(getattr(guard, "strict", False))
     all_inside = True
     for expr in guard.constraints:
         val = _eval_constraint_on_box(expr, box, state_vars, time_interval, time_var_name)
 
-        # strictly violated everywhere: g(x) > 0 on entire box
-        if val.lower > 0:
+        # strictly violated everywhere
+        if guard_strict:
+            if val.lower >= 0:
+                return "VIOLATED"
+        elif val.lower > 0:
             return "VIOLATED"
-        
-        # strictly satisfied everywhere: g(x) <= 0 on entire box
-        if val.upper <= 0:
+
+        # strictly satisfied everywhere
+        if guard_strict:
+            if val.upper < 0:
+                continue
+        elif val.upper <= 0:
             continue
 
         # overlaps boundary: lo <= 0 < hi

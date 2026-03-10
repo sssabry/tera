@@ -1,6 +1,6 @@
 """ARCH benchmark task definitions."""
 from typing import Any, Dict, List, Optional
-from sage.all import SR, var, sin, cos
+from sage.all import SR, var, sin, cos, sqrt, tan, pi
 import numpy as np
 
 from TERA.TMCore.Interval import Interval
@@ -71,29 +71,36 @@ def get_arch19_cont_laubloomis_variants() -> Dict[str, TaskConfig]:
 
     return tasks
 
+
 ## HYBRID AUTOMATON BUILDERS
-def build_lotka_volterra_crossing_automaton():
+def build_lotka_volterra_crossing_automaton(Qx=1.0, Qy=1.0, R=0.15):
     """Build the ARCH20 Lotka-Volterra crossing automaton."""
     x, y, cnt = var("x y cnt")
 
-    # Dynamics (Predator-Prey)
-    f_base = [3 * x - 3 * x * y, x * y - y]
+    phi = (x - Qx)**2 + (y - Qy)**2 - R**2
 
-    # Nonlinear Guard: circle of radius 0.15 around (1,1)
-    guard_expr = (x - 1) ** 2 + (y - 1) ** 2 - 0.15**2
+    dx = 3*x - 3*x*y
+    dy = x*y - y
 
-    mode_out = Mode("outside", f_base + [0], Condition([guard_expr]))  # guard_expr >= 0
-    mode_in = Mode("inside", f_base + [1], Condition([-guard_expr]))   # guard_expr <= 0
+    g_out_to_in = Condition(constraints=[phi], strict=False) # phi <= 0
+    g_in_to_out = Condition(constraints=[-phi], strict=False) # phi >= 0
+    
+    inv_outside = Condition(constraints=[-phi], strict=True) # phi > 0
+    inv_inside  = Condition(constraints=[phi], strict=True) # phi < 0
 
-    mode_out.transitions.append(
-        Transition(mode_out, mode_in, Condition([-guard_expr]), ResetMap({}), "enter")
+    outside = Mode("outside", [dx, dy, SR(0)], inv_outside)
+    inside  = Mode("inside",  [dx, dy, SR(1)], inv_inside)
+
+    id_reset = ResetMap({})
+
+    outside.transitions.append(
+        Transition(outside, inside, g_out_to_in, id_reset, "enter")
     )
-    mode_in.transitions.append(
-        Transition(mode_in, mode_out, Condition([guard_expr]), ResetMap({}), "exit")
+    inside.transitions.append(
+        Transition(inside, outside, g_in_to_out, id_reset, "exit")
     )
 
-    return HybridAutomaton([mode_out, mode_in], [x, y, cnt], "t")
-
+    return HybridAutomaton([outside, inside], [x, y, cnt], "t")
 
 def build_space_rendezvous_automaton():
     """Build the ARCH 2018 space rendezvous automaton."""
@@ -118,6 +125,10 @@ def build_space_rendezvous_automaton():
         [-288.0288, 0.1312, -9614.9898, 0],
         [-0.1312, -288, 0, -9614.9883],
     ]
+    K0 = [
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+    ]
 
     def get_dyn(K):
         ux = K[0][0] * x + K[0][1] * y + K[0][2] * vx + K[0][3] * vy
@@ -129,33 +140,45 @@ def build_space_rendezvous_automaton():
             n**2 * y - 2 * n * vx - (mu / rc**3) * y + uy / mc,
         ]
 
-    # mode: Approaching
-    # approaching: x <= -100  -> (x + 100) <= 0
-    mode_app = Mode("approaching", get_dyn(K1), Condition([x + 100]))
+    tan30 = tan(pi / 6)
 
-    # rendezvous: x >= -100 -> (-(x + 100)) <= 0
-    mode_rend = Mode("rendezvous", get_dyn(K2), Condition([-(x + 100)]))
+    # invariants
+    # approaching: x <= -100 and t <= 150
+    inv_app = Condition([
+        x + 100,
+        t - 150,
+    ])
 
-    # aborting: passive (zero control)
-    K0 = [[0, 0, 0, 0], [0, 0, 0, 0]]
-    mode_abort = Mode("aborting", get_dyn(K0), Condition([]))
+    # rendezvous_attempt:
+    inv_rend = Condition([
+        -(x + 100),
+        x * tan30 - y,
+        x * tan30 + y,
+        vx**2 + vy**2 - 3.3**2,
+        t - 150,
+    ])
 
-    # Transitions:
-    # approaching -> rendezvous when x >= -100  (-(x+100)) <= 0
-    mode_app.transitions.append(
-        Transition(mode_app, mode_rend, Condition([-(x + 100)]), ResetMap({}), "to_rendezvous")
-    )
+    # aborting: no invariant here; collision avoidance is checked afterwards
+    inv_abort = Condition([])
 
-    # abort when t >= 120: (120 - t) <= 0
+    mode_app   = Mode("approaching",          get_dyn(K1), inv_app)
+    mode_rend  = Mode("rendezvous_attempt",   get_dyn(K2), inv_rend)
+    mode_abort = Mode("aborting",             get_dyn(K0), inv_abort)
+
+    # controller switch at x >= -100
+    guard_to_rend = Condition([-(x + 100)])
+
+    # nondeterministic abort available for t >= 120
+    # upper end t <= 150 is enforced by source-mode invariants
     abort_guard = Condition([120 - t])
-    mode_app.transitions.append(
-        Transition(mode_app, mode_abort, abort_guard, ResetMap({}), "abort_early")
-    )
-    mode_rend.transitions.append(
-        Transition(mode_rend, mode_abort, abort_guard, ResetMap({}), "abort_late")
-    )
 
-    return HybridAutomaton([mode_app, mode_rend, mode_abort], [x, y, vx, vy], "t")
+    id_reset = ResetMap({})
+
+    mode_app.transitions.append(Transition(mode_app, mode_rend, guard_to_rend, id_reset, "to_rendezvous"))
+    mode_app.transitions.append(Transition(mode_app, mode_abort, abort_guard, id_reset, "abort_early"))
+    mode_rend.transitions.append(Transition(mode_rend, mode_abort, abort_guard, id_reset, "abort_late"))
+
+    return HybridAutomaton([mode_app, mode_rend, mode_abort],[x, y, vx, vy], "t")
 
 
 
@@ -401,11 +424,38 @@ def get_arch_continuous_2021() -> Dict[str, TaskConfig]:
 
 # ARCH: Hybrid benchmarks by year
 
-def get_arch_hybrid_2018() -> Dict[str, TaskConfig]:
-    """Return ARCH 2018 hybrid benchmarks."""
+def get_arch_hybrid_2020() -> Dict[str, TaskConfig]:
+    """Return ARCH 2020 hybrid benchmarks."""
     tasks: Dict[str, TaskConfig] = {}
 
-    tasks["arch18_hybrid_space_rendezvous"] = TaskConfig(
+    eps = 0.008
+    tasks["arch20_hybrid_lovo20"] = TaskConfig(
+        name="Lotka-Volterra Crossing (ARCH 2020)",
+        system_type="hybrid",
+        vars=list(var("x y cnt")),
+        initial_set=[Interval(1.3 - eps, 1.3 + eps),Interval(1.0, 1.0),Interval(0.0, 0.0),],
+        initial_mode="outside",
+        time_horizon=3.64,
+        order=3,
+        urgent_jumps_mode=True,
+        step_size=0.01,
+        engine_params={
+            "automaton": build_lotka_volterra_crossing_automaton(),
+            "max_jumps": 10,
+            'min_step': 1e-3,
+            'max_step': 0.01,
+            "fixed_step_mode": False,
+            'intersection_method': 'domain_contraction',
+            'aggregation_method': "PCA",
+            "initial_split": {
+                "enabled": True,
+                "dim": 0,
+                "parts": 5
+            },
+        },
+    )
+
+    tasks["arch20_hybrid_space_rendezvous"] = TaskConfig(
         name="Space Rendezvous (ARCH 2018)",
         system_type="hybrid",
         vars=list(var("x y vx vy")),
@@ -417,39 +467,13 @@ def get_arch_hybrid_2018() -> Dict[str, TaskConfig]:
         urgent_jumps_mode=False,
         remainder_estimation=[Interval(-1e-3, 1e-3)] * 4,
         engine_params={
-            "automaton": build_space_rendezvous_automaton(),  # TODO: Confirm automaton parameters against the ARCH spec.
+            "automaton": build_space_rendezvous_automaton(),
             "max_jumps": 5,
             "fixed_step_mode": False,
             "min_step": 0.001,
             "max_step": 0.5,
             "plot_dims": (0, 1),
             "cutoff_threshold": 1e-6,
-        },
-    )
-
-    return tasks
-
-
-def get_arch_hybrid_2020() -> Dict[str, TaskConfig]:
-    """Return ARCH 2020 hybrid benchmarks."""
-    tasks: Dict[str, TaskConfig] = {}
-
-    tasks["arch20_hybrid_lotka_volterra_crossing"] = TaskConfig(
-        name="Lotka-Volterra Crossing (ARCH 2020)",
-        system_type="hybrid",
-        vars=list(var("x y cnt")),
-        initial_set=[Interval(1.292, 1.308), Interval(1.0, 1.0), Interval(0.0, 0.0)],
-        initial_mode="outside",
-        time_horizon=3.64,
-        order=5,
-        urgent_jumps_mode=True,
-        step_size=0.0001,
-        engine_params={
-            "automaton": build_lotka_volterra_crossing_automaton(),
-            "max_jumps": 100,
-            'min_step': 0.0000001,
-            "fixed_step_mode": False,
-            "plot_dims": (0, 1),
         },
     )
 

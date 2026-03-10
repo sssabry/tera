@@ -7,12 +7,10 @@ acts as the mode-specific continuous reachability engine
 enforces the mode invariants because flowpipes are only valid if compliant
 """
 import copy
-import numpy as np
 from typing import List, Dict, Tuple, Optional, Any
-from dataclasses import dataclass, field
 
 from TERA.TMFlow.TMReach import TMReach
-from TERA.Hybrid.HybridModel import Mode, Condition, Transition
+from TERA.Hybrid.HybridModel import Mode, Condition
 from TERA.Hybrid import Intersection
 
 from TERA.TMCore.TMVector import TMVector
@@ -62,6 +60,8 @@ class ModeSolver(TMReach):
         self.current_mode = mode
         self.invariant = mode.invariant
         self.stop_integration = False
+        self.boundary_event = False
+        self.boundary_step_info = None
         self._constraint_cache = {}
 
     def propagate_mode_evolution(self, initial_set:TMVector, time_end: float, time_start: float) -> Tuple[List[Dict], str]:
@@ -80,6 +80,8 @@ class ModeSolver(TMReach):
 
         # 1. reset flags
         self.stop_integration = False
+        self.boundary_event = False
+        self.boundary_step_info = None
 
         state_dim = len(self.state_vars)
         if len(initial_set.tms) != state_dim:
@@ -89,12 +91,7 @@ class ModeSolver(TMReach):
         if hasattr(initial_set, "domain") and initial_set.domain is not None and len(initial_set.domain) > state_dim:
             initial_set.domain = list(initial_set.domain[:state_dim])
 
-
-        # 2. set initial step size 
-        setting = self.config.get('setting', 'single_step')
-        if setting != "single_step":
-            print("Hybrid reachability is only currently available based on 'single_step' continuous reachability.")
-        # 3. trigger TMReach
+        # 2. trigger TMReach
         flowpipes, status = self.reach(
             setting="single_step",
             initial_set=initial_set,
@@ -102,6 +99,8 @@ class ModeSolver(TMReach):
             time_end=time_end,
             time_start=time_start
         )
+        if self.boundary_event:
+            status = "BOUNDARY_EVENT"
         
         return flowpipes, status
     
@@ -143,13 +142,19 @@ class ModeSolver(TMReach):
         bounds = current_tmv.bound()
 
         quick_status = self._check_interval_satisfaction(bounds, self.invariant)
-
+        
         if quick_status == "FULL":
             step_info['is_valid'] = True
         elif quick_status == "EMPTY":
-            self.stop_integration = True 
             step_info['is_valid'] = False
-        else:
+            exit_info, _action = self._localize_invariant_exit(step_info, h)
+            if exit_info is not None:
+                self.stop_integration = True
+                self.boundary_event = True
+                self.boundary_step_info = exit_info
+                return
+            self.stop_integration = True
+        elif quick_status == "UNKNOWN":
             # reject step then try to contract
             step_info['is_valid'] = False
             contracted = None
@@ -158,21 +163,84 @@ class ModeSolver(TMReach):
                     current_tmv,
                     self.invariant,
                     self.state_vars,
-                    method="domain_contraction", 
+                    method="domain_contraction",
                 )
 
-                if contracted is not None:
-                    step_info['tmv'] = contracted
-                    step_info['is_valid'] = True
-                    self.stop_integration = False
             if contracted is not None:
                 step_info['tmv'] = contracted
                 step_info['is_valid'] = True
                 self.stop_integration = False
 
             else:
+                exit_info, _action = self._localize_invariant_exit(step_info, h)
+                if exit_info is not None:
+                    self.boundary_event = True
+                    self.boundary_step_info = exit_info
                 self.stop_integration = True
                 step_info['is_valid'] = False
+        else:
+            step_info['is_valid'] = False
+            self.stop_integration = True
+
+    def _resolve_abs_time_lower(self, t_iv: Optional[Interval]) -> float:
+        if t_iv is None:
+            return 0.0
+        t_lo = float(t_iv.lower)
+        mode_start_abs = self.config.get("mode_start_abs", None)
+        if mode_start_abs is not None:
+            t0 = float(mode_start_abs)
+            # ensure not local time interval
+            if t_lo < (t0 - 1e-12):
+                return t0 + t_lo
+        return t_lo
+
+    def _slice_tmv_by_local_time(self, tmv: TMVector, t_lo: float, t_hi: float) -> TMVector:
+        out = copy.deepcopy(tmv)
+        if len(out.domain) >= len(self.state_vars) + 1:
+            out.domain[-1] = Interval(float(t_lo), float(t_hi))
+            for tm in out.tms:
+                if len(tm.domain) >= len(self.state_vars) + 1:
+                    tm.domain[-1] = Interval(float(t_lo), float(t_hi))
+        return out
+
+    def _localize_invariant_exit(self, step_info: dict, h: float):
+        tmv = step_info.get("tmv", None)
+        t_abs = step_info.get("time_interval_abs", None)
+        if tmv is None or t_abs is None:
+            return None, "underflow"
+        if len(tmv.domain) < len(self.state_vars) + 1:
+            return None, "underflow"
+        max_ref = int(self.config.get("max_iterations", 40))
+        min_dt = max(float(self.min_step), 1e-9)
+        lo = 0.0
+        hi = float(h)
+        for _ in range(max_ref):
+            if (hi - lo) <= min_dt:
+                break
+            mid = 0.5 * (lo + hi)
+            left = self._slice_tmv_by_local_time(tmv, lo, mid)
+            left_status = self._check_interval_satisfaction(left.bound(), self.invariant)
+            if left_status == "EMPTY":
+                hi = mid
+            elif left_status == "FULL":
+                lo = mid
+            else:
+                hi = mid
+                break
+        if (hi - lo) <= 0.0:
+            return None, "underflow"
+        cand = self._slice_tmv_by_local_time(tmv, lo, hi)
+        base_abs_lo = self._resolve_abs_time_lower(t_abs)
+        abs_lo = base_abs_lo + lo
+        abs_hi = base_abs_lo + hi
+        out = {
+            "tmv": cand,
+            "time_interval": Interval(lo, hi),
+            "time_interval_abs": Interval(abs_lo, abs_hi),
+            "is_valid": False,
+            "force_jump": True,
+        }
+        return out, "enqueue_exit"
 
     def _check_interval_satisfaction(self, bounds: List[Interval], condition: Condition) -> str:
         """
@@ -190,6 +258,7 @@ class ModeSolver(TMReach):
         if not condition or not condition.constraints:
              return "FULL" # No invariant = always satisfied
 
+        cond_strict = bool(getattr(condition, "strict", False))
         all_inside = True
         
         # iterate over every invariant g_i(x) <= 0
@@ -198,17 +267,20 @@ class ModeSolver(TMReach):
             val_interval = self._eval_constraint(constraint, bounds)
             
             # case 1: Strictly Violated
-            # if the lower bound of g(x) is > 0, then g(x) is positive everywhere in the box.
-            if val_interval.lower > 0:
+            if cond_strict:
+                if val_interval.lower >= 0:
+                    return "EMPTY"
+            elif val_interval.lower > 0:
                 return "EMPTY"
             
             # case 2: Strictly Satisfied
-            # if the upper bound of g(x) is <= 0, then g(x) is negative everywhere.
-            if val_interval.upper <= 0:
-                continue 
+            if cond_strict:
+                if val_interval.upper < 0:
+                    continue
+            elif val_interval.upper <= 0:
+                continue
             
             # case 3: Overlap
-            # lo <= 0 < hi. The boundary g(x)=0 passes through the box.
             all_inside = False
             
         if all_inside:
@@ -236,4 +308,3 @@ class ModeSolver(TMReach):
         except Exception as e:
             val = RIF(expr)
             return Interval(val.lower(), val.upper())
-        

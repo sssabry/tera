@@ -1,4 +1,4 @@
-"""Task execution entry points and helpers."""
+﻿"""Task execution entry points and helpers."""
 
 from TERA.TMFlow.TMReach import TMReach
 from TERA.Hybrid.HybridReach import HybridReach
@@ -71,6 +71,113 @@ def create_initial_box_continuous(dim: int, bounds: list, order: int, time_var: 
     tms.append(tau_tm)
 
     return TMVector(tms)
+
+def create_initial_box_hybrid(var_syms: list, bounds: list, order: int) -> TMVector:
+    """creates a state-only TMV for a hybrid initial box (1 TM per state var)
+    """
+    if len(bounds) != len(var_syms):
+        raise ValueError(
+            f"create_initial_box_hybrid: len(bounds)={len(bounds)} but len(var_syms)={len(var_syms)}"
+        )
+
+    state_var_names = [str(v) for v in var_syms]
+    tms = [
+        init_taylor_model(v, state_var_names, bounds, order=order, expand_function=False)
+        for v in var_syms
+    ]
+    return TMVector(tms)
+
+
+def _clone_interval_box(bounds: list) -> list:
+    """Deep-copy an interval box as a fresh list of Interval objects."""
+    return [Interval(float(iv.lower), float(iv.upper)) for iv in bounds]
+
+
+def _split_interval_box_once(bounds: list, split_dim: int, parts: int) -> list:
+    """Split one interval box along a single dimension into `parts` sub-boxes."""
+    if parts <= 1:
+        return [_clone_interval_box(bounds)]
+
+    if split_dim < 0 or split_dim >= len(bounds):
+        raise ValueError(
+            f"_split_interval_box_once: split_dim={split_dim} out of range for len(bounds)={len(bounds)}"
+        )
+
+    iv = bounds[split_dim]
+    lo = float(iv.lower)
+    hi = float(iv.upper)
+
+    if hi < lo:
+        raise ValueError(
+            f"_split_interval_box_once: invalid interval on dim {split_dim}: [{lo}, {hi}]"
+        )
+
+    # Degenerate interval: nothing to split
+    if hi == lo:
+        return [_clone_interval_box(bounds)]
+
+    width = (hi - lo) / float(parts)
+    boxes = []
+
+    for k in range(parts):
+        a = lo + k * width
+        b = hi if k == parts - 1 else lo + (k + 1) * width
+
+        piece = _clone_interval_box(bounds)
+        piece[split_dim] = Interval(a, b)
+        boxes.append(piece)
+
+    return boxes
+
+
+def get_hybrid_initial_boxes(initial_set: list, engine_params: dict) -> list:
+    """return 1+ hybrid init boxes according to user config (if any)
+    config format: engine_params["initial_split"] = { "enabled": True, "dims": [0] or 0
+    "parts": [5] or 5}
+    """
+    base_box = _clone_interval_box(initial_set)
+
+    split_cfg = engine_params.get("initial_split", None)
+    if not split_cfg:
+        return [base_box]
+
+    if not bool(split_cfg.get("enabled", False)):
+        return [base_box]
+
+    dims = split_cfg.get("dims", split_cfg.get("dim", None))
+    parts = split_cfg.get("parts", None)
+
+    if dims is None:
+        raise ValueError(
+            "initial_split enabled but no split dimension provided. "
+            "Use {'enabled': True, 'dims': [0], 'parts': [5]}."
+        )
+
+    if isinstance(dims, int):
+        dims = [dims]
+    else:
+        dims = list(dims)
+
+    if parts is None:
+        parts = [2] * len(dims)
+    elif isinstance(parts, int):
+        parts = [parts] * len(dims)
+    else:
+        parts = list(parts)
+
+    if len(parts) != len(dims):
+        raise ValueError(
+            f"initial_split mismatch: len(dims)={len(dims)} but len(parts)={len(parts)}"
+        )
+
+    boxes = [base_box]
+    for split_dim, n_parts in zip(dims, parts):
+        next_boxes = []
+        for box in boxes:
+            next_boxes.extend(_split_interval_box_once(box, int(split_dim), int(n_parts)))
+        boxes = next_boxes
+
+    return boxes
 
 def create_initial_box_stochastic(state_dim: int, bounds: list, order: int, time_var: str = "t") -> TMVector:
     """Create a TMVector for a stochastic initial box including time.
@@ -178,7 +285,6 @@ class TaskRunner:
             id_stag_lambda=config.engine_params.get('id_stag_lambda', 1.0),
             hybrid_id_full_linear_on_stagnation=config.engine_params.get('hybrid_id_full_linear_on_stagnation', False),
             shrink_wrap_mode=config.engine_params.get('shrink_wrap_mode', False),
-            verbose=config.engine_params.get('verbose', False),
             progress_bar=progress_bar
         )
         
@@ -194,20 +300,25 @@ class TaskRunner:
     @staticmethod
     def _run_hybrid(config: TaskConfig, progress_bar: bool) -> ReachResult:
         automaton = config.engine_params.get('automaton')
-        
-        state_var_names = [str(v) for v in config.vars]
-        tms = [init_taylor_model(v, state_var_names, config.initial_set, 
-                                order=config.order, expand_function=False) 
-            for v in config.vars]
-        initial_tmv = TMVector(tms)
-        
-        automaton.add_initial_state(config.initial_mode, initial_tmv)
-        
-        step_size = config.step_size
+        if automaton is None:
+            raise ValueError("Hybrid task missing engine_params['automaton'].")
+
         ep = config.engine_params
+
+        if hasattr(automaton, "initial_sets"):
+            automaton.initial_sets = []
+
+        initial_boxes = get_hybrid_initial_boxes(config.initial_set, ep)
+
+        for box in initial_boxes:
+            initial_tmv = create_initial_box_hybrid(config.vars, box, config.order)
+            automaton.add_initial_state(config.initial_mode, initial_tmv)
+
+        step_size = config.step_size
         min_step = ep.get('min_step', step_size * 0.1)
         max_step = ep.get('max_step', step_size * 2)
-        
+        tau_default = max(2.0 * float(min_step), 1.0 * float(step_size))
+
         engine_cfg = {
             'time_horizon': config.time_horizon,
             'max_jumps': ep.get('max_jumps', 10),
@@ -215,12 +326,14 @@ class TaskRunner:
             'state_vars': config.vars,
             'time_var': config.time_var,
             'urgent_jumps_mode': config.urgent_jumps_mode,
+            'remainder_estimation': config.remainder_estimation,
             'precondition_setup': ep.get('precondition_setup', 'ID'),
             'setting': ep.get('setting', 'single_step'),
             'fixed_step_mode': ep.get('fixed_step_mode', False),
             'min_step': min_step,
             'max_step': max_step,
             'initial_step': step_size,
+            'step_size': step_size,
             'intersection_method': ep.get('intersection_method', 'combined'),
             'aggregation_method': ep.get('aggregation_method', 'PCA'),
             'aggregation_threshold': ep.get('aggregation_threshold', 10),
@@ -235,21 +348,43 @@ class TaskRunner:
             'id_stag_od_rel_tol': ep.get('id_stag_od_rel_tol', 1e-6),
             'id_stag_lambda': ep.get('id_stag_lambda', 1.0),
             'hybrid_id_full_linear_on_stagnation': ep.get('hybrid_id_full_linear_on_stagnation', False),
-            'progress_bar': progress_bar
+            'progress_bar': progress_bar,
         }
-        
+
+        split_cfg = ep.get("initial_split", None)
+        if split_cfg and bool(split_cfg.get("enabled", False)):
+            print(f"[TaskRunner] Hybrid initial-set splitting active: produced {len(initial_boxes)} initial box(es).")
+
         engine = HybridReach(automaton, engine_cfg)
         flowpipe = engine.compute_reachability()
-        
+
         if flowpipe and len(flowpipe) > 0:
-            final_horizon = float(flowpipe[-1]["time_interval_abs"].upper)
             time_horizon = float(config.time_horizon)
             tol = float(ep.get("horizon_tol", 1e-6))
-            status = "SUCCESS" if final_horizon + tol >= time_horizon else "PARTIAL"
+
+            observed_t_max = None
+            for seg in flowpipe:
+                if not isinstance(seg, dict):
+                    continue
+                t_iv = seg.get("time_interval_abs", None)
+                if t_iv is None:
+                    continue
+                try:
+                    t_u = float(t_iv.upper)
+                except Exception:
+                    continue
+
+                if observed_t_max is None or t_u > observed_t_max:
+                    observed_t_max = t_u
+
+            if observed_t_max is None:
+                status = "FAILED"
+            else:
+                status = "SUCCESS" if observed_t_max + tol >= time_horizon else "PARTIAL"
         else:
             status = "FAILED"
-        return ReachResult(flowpipe, "hybrid", config.vars, vars(config), status=status)
 
+        return ReachResult(flowpipe, "hybrid", config.vars, vars(config), status=status)
     @staticmethod
     def _run_stochastic(config: TaskConfig, validate_results: bool, progress_bar: bool) -> ReachResult:
         ep = config.engine_params
