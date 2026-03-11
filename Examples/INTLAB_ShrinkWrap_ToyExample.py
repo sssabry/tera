@@ -41,7 +41,6 @@ def run():
             max_iter=10,
             q_cap=1.3,
             use_preconditioning=False,
-            verbose=True,
         )
         assert sw.get("success", False), f"shrink wrap failed for delta={delta}: {sw}"
         tm_sw = sw["T_sw"].tms[0]

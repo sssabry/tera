@@ -98,7 +98,6 @@ Used by `TMReach` and preconditioning components.
 | `engine_params.max_step` | float | `0.5` | Upper bound on adaptive step. |
 | `engine_params.step_grow_width_cap` | float | `1e-2` (if None, continuous) | Caps how aggressively step size grows when widths are small. |
 | `engine_params.shrink_wrap_mode` | bool | `False` | Enable Bünger-corrected shrink wrapping in left-right mode (continuous/stochastic). |
-| `engine_params.verbose` | bool | `False` | Enable verbose diagnostics (shrink wrapping and invariant checks). |
 
 ### 3.4 Algebra / verification loop controls
 

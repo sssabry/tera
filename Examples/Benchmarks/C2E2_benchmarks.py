@@ -314,6 +314,68 @@ def get_c2e2_continuous() -> Dict[str, TaskConfig]:
         engine_params=base_engine_params.copy(),
     )
 
+    x, y = var("x y")
+
+    tasks["cont_brusselator"] = TaskConfig(
+        name="C2E2 Brusselator",
+        system_type="continuous",
+        vars=[x, y],
+        f_expr=[
+            1 + x**2 * y - 2.5 * x,
+            1.5 * x - x**2 * y,
+        ],
+        initial_set=[
+            Interval(2.0, 3.0),
+            Interval(1.0, 1.5),
+        ],
+        unsafe_sets=[
+            {
+                "dims": {0: Interval(10.0, float("inf"))},
+                "start_time": 0.0,
+            }
+        ],
+        time_horizon=10.0,
+        order=10,
+        step_size=0.01,
+        time_var="t",
+        engine_params={
+            "fixed_step_mode": False,
+            "precondition_setup": "ID",
+            "setting": "single_step",
+        },
+    )
+
+    x, y = var("x y")
+
+    tasks["cont_buckingcol"] = TaskConfig(
+        name="C2E2 Buckling Column",
+        system_type="continuous",
+        vars=[x, y],
+        f_expr=[
+            y,
+            2*x - x**3 - 0.2*y + 0.1,
+        ],
+        initial_set=[
+            Interval(-0.5, -0.4),
+            Interval(-0.5, -0.4),
+        ],
+        unsafe_sets=[
+            {
+                "dims": {0: Interval(10.0, float("inf"))},
+                "start_time": 0.0,
+            }
+        ],
+        time_horizon=10.0,
+        order=10,
+        step_size=0.01,
+        time_var="t",
+        engine_params={
+            "fixed_step_mode": True,
+            "precondition_setup": "ID",
+            "setting": "single_step",
+        },
+    )
+
     return tasks
 
 def build_cardiac_cell_automaton():
