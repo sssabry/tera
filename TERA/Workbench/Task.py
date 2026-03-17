@@ -249,6 +249,7 @@ class TaskRunner:
             Report.print_header(result)
 
             if result.status == "SUCCESS":
+                Report.print_final_set(result)
 
                 if config.unsafe_sets:
                     result.safety_status = Report.check_safety(result, config.unsafe_sets)

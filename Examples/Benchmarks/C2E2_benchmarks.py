@@ -51,7 +51,7 @@ def get_c2e2_continuous() -> Dict[str, TaskConfig]:
         unsafe_sets=[{"dims": {0: Interval(100.0, float("inf"))}, "start_time": 0.0}],
         time_horizon=10.0,
         order=6,
-        step_size=0.5,
+        step_size=0.2,
         time_var="t",
         engine_params={"fixed_step_mode": False, "setting": "single_step"}
     )

@@ -184,7 +184,28 @@ class Report:
             diff = max_comp_width - target_width
             print(f"  [WIDTH]  FAIL: Enclosure is {diff:.4f} wider than benchmark.")
             return False
+        
+    @staticmethod
+    def print_final_set(result: ReachResult):
+        """Print final reachable-set bounds and widths for any successful run."""
+        if not result.flowpipe:
+            print("\n[Final Set] Empty flowpipe.\n")
+            return
 
+        computed_bounds = result.get_final_bounds()
+
+        print("\nFinal Reachable Set Bounds (t_end)")
+        print(f"{'Dim':<10} | {'Interval':<30} | {'Width':<12}")
+        print("-" * 60)
+
+        for i, var in enumerate(result.state_vars):
+            comp = computed_bounds[i]
+            low = float(comp.lower)
+            high = float(comp.upper)
+            width = high - low
+            interval_str = f"[{low:10.5f}, {high:10.5f}]"
+            print(f"{str(var):<10} | {interval_str:<30} | {width:<12.6f}")
+    
     @staticmethod
     def print_stochastic_stats(result: ReachResult):
         """Print stochastic statistics and MC comparison if available."""
@@ -209,31 +230,31 @@ class Report:
         Xstoch = payload[1]
         Xdet = payload[2] if len(payload) >= 3 else None
 
-        # Final bounds
-        print("\nFinal Reachable Set Bounds (t_end)")
-        last_seg = flowpipe[-1]
-        final_tmv = last_seg['tmv']
-        r_final = float(last_seg.get('stochastic_radius', 0.0))
+        # # Final bounds
+        # print("\nFinal Reachable Set Bounds (t_end)")
+        # last_seg = flowpipe[-1]
+        # final_tmv = last_seg['tmv']
+        # r_final = float(last_seg.get('stochastic_radius', 0.0))
 
-        det_bounds = final_tmv.bound()
-        diag_p_inv = result.validation_data.get('diag_P_inv_upper')
+        # det_bounds = final_tmv.bound()
+        # diag_p_inv = result.validation_data.get('diag_P_inv_upper')
 
-        # NOTE: This is a box overapproximation of ball dilation by radius r_final.
-        print(f"{'Dim':<10} | {'Deterministic Interval':<30} | {'Stochastic box overapprox (1-δ)':<30}")
-        print("-" * 90)
+        # # NOTE: This is a box overapproximation of ball dilation by radius r_final.
+        # print(f"{'Dim':<10} | {'Deterministic Interval':<30} | {'Stochastic box overapprox (1-δ)':<30}")
+        # print("-" * 90)
 
-        for i, var in enumerate(result.state_vars):
-            det_low, det_high = float(det_bounds[i].lower), float(det_bounds[i].upper)
-            if diag_p_inv is not None and i < len(diag_p_inv):
-                delta_i = r_final * math.sqrt(diag_p_inv[i])
-                delta_i = math.nextafter(delta_i, math.inf)
-            else:
-                delta_i = r_final
-            stoch_low, stoch_high = det_low - delta_i, det_high + delta_i
+        # for i, var in enumerate(result.state_vars):
+        #     det_low, det_high = float(det_bounds[i].lower), float(det_bounds[i].upper)
+        #     if diag_p_inv is not None and i < len(diag_p_inv):
+        #         delta_i = r_final * math.sqrt(diag_p_inv[i])
+        #         delta_i = math.nextafter(delta_i, math.inf)
+        #     else:
+        #         delta_i = r_final
+        #     stoch_low, stoch_high = det_low - delta_i, det_high + delta_i
 
-            det_str = f"[{det_low:10.5f}, {det_high:10.5f}]"
-            stoch_str = f"[{stoch_low:10.5f}, {stoch_high:10.5f}]"
-            print(f"{str(var):<10} | {det_str:<30} | {stoch_str:<30}")
+        #     det_str = f"[{det_low:10.5f}, {det_high:10.5f}]"
+        #     stoch_str = f"[{stoch_low:10.5f}, {stoch_high:10.5f}]"
+        #     print(f"{str(var):<10} | {det_str:<30} | {stoch_str:<30}")
 
         # Validation statistics: compare empirical deviation vs AMGF radius:
         max_empirical_dev = 0.0
